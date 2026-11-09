@@ -12,9 +12,14 @@ jobs:
 
       - name: Setup Crave CLI
         run: |
+          # Completely clean and recreate the local binary folder to remove corrupt HTML downloads
+          rm -rf ${HOME}/bin
           mkdir -p ${HOME}/bin
-          # Download the stable production Linux CLI binary directly from GitHub Releases
+          
+          # Download the direct executable binary from the official release vehicle archive
           curl -sLo ${HOME}/bin/crave https://github.com
+          
+          # Assign executable rights and append path layout smoothly
           chmod +x ${HOME}/bin/crave
           echo "${HOME}/bin" >> $GITHUB_PATH
 
