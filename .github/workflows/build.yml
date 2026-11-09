@@ -15,21 +15,15 @@ jobs:
 
       - name: Setup Crave CLI
         run: |
-          # 1. Clean up everything completely
+          # Completely clean and recreate the local binary folder
           rm -rf ${HOME}/bin
           mkdir -p ${HOME}/bin
           
-          # 2. Use the official script to fetch the tool dynamically
-          curl -s https://githubusercontent.com | bash
+          # Force download the exact verified binary directly from the official stable release assets page
+          curl -sLo ${HOME}/bin/crave https://github.com
           
-          # 3. Rename the binary to crave_runner to avoid any text profile matching errors
-          if [ -f crave ]; then
-            mv crave ${HOME}/bin/crave_runner
-          elif [ -f ${HOME}/bin/crave ]; then
-            mv ${HOME}/bin/crave ${HOME}/bin/crave_runner
-          fi
-          
-          chmod +x ${HOME}/bin/crave_runner
+          # Apply structural permission changes
+          chmod +x ${HOME}/bin/crave
           echo "${HOME}/bin" >> $GITHUB_PATH
 
       - name: Authenticate Crave
@@ -45,20 +39,20 @@ jobs:
 
       - name: Initialize Crave Workspace
         run: |
-          ${HOME}/bin/crave_runner clone create --project aera-recovery-selene || true
+          ${HOME}/bin/crave clone create --project aera-recovery-selene || true
 
       - name: Setup Manifest
         run: |
-          ${HOME}/bin/crave_runner run -- "mkdir -p .repo/local_manifests"
-          curl -sL https://githubusercontent.com | ${HOME}/bin/crave_runner run -- "cat > .repo/local_manifests/aera.xml"
+          ${HOME}/bin/crave run -- "mkdir -p .repo/local_manifests"
+          curl -sL https://githubusercontent.com | ${HOME}/bin/crave run -- "cat > .repo/local_manifests/aera.xml"
 
       - name: Sync and Compile
         run: |
-          ${HOME}/bin/crave_runner run -- "repo sync -c -j\$(nproc --all) --force-sync --no-clone-bundle --no-tags && chmod +x device/xiaomi/selene/build-aera-selene.sh && ./device/xiaomi/selene/build-aera-selene.sh"
+          ${HOME}/bin/crave run -- "repo sync -c -j\$(nproc --all) --force-sync --no-clone-bundle --no-tags && chmod +x device/xiaomi/selene/build-aera-selene.sh && ./device/xiaomi/selene/build-aera-selene.sh"
 
       - name: Pull Image
         run: |
-          ${HOME}/bin/crave_runner pull out/target/product/selene/AERA-R1.0-Alpha-Unofficial-selene.img || ${HOME}/bin/crave_runner pull out/target/product/selene/AERA-*.img
+          ${HOME}/bin/crave pull out/target/product/selene/AERA-R1.0-Alpha-Unofficial-selene.img || ${HOME}/bin/crave pull out/target/product/selene/AERA-*.img
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
