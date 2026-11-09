@@ -15,14 +15,12 @@ jobs:
 
       - name: Setup Crave CLI
         run: |
-          # Completely clean and recreate the local binary folder
           rm -rf ${HOME}/bin
           mkdir -p ${HOME}/bin
           
-          # Force download the exact verified binary directly from the official stable release assets page
+          # Download the stable, production binary directly from the official FOSS-Cloud mirror
           curl -sLo ${HOME}/bin/crave https://github.com
           
-          # Apply structural permission changes
           chmod +x ${HOME}/bin/crave
           echo "${HOME}/bin" >> $GITHUB_PATH
 
