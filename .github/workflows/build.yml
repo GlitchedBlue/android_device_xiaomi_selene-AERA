@@ -12,9 +12,19 @@ jobs:
 
       - name: Setup Crave CLI
         run: |
-          mkdir ${HOME}/bin
-          curl -sL https://githubusercontent.com | bash -s --
-          mv crave ${HOME}/bin/
+          mkdir -p ${HOME}/bin
+          # Directly download the official Linux binary from Crave's distribution server
+          curl -sL https://githubusercontent.com | bash
+          # Ensure crave exists or find where get_crave put it, then place it safely in binary path
+          if [ -f crave ]; then
+            mv crave ${HOME}/bin/
+          elif [ -f ${HOME}/bin/crave ]; then
+            echo "Crave already in bin"
+          else
+            # Fallback download link directly if script changes naming patterns
+            curl -sLo ${HOME}/bin/crave https://github.com || curl -sLo ${HOME}/bin/crave https://githubusercontent.com
+          fi
+          chmod +x ${HOME}/bin/crave
           echo "${HOME}/bin" >> $GITHUB_PATH
 
       - name: Authenticate Crave
