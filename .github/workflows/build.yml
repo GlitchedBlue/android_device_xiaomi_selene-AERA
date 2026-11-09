@@ -12,16 +12,14 @@ jobs:
 
       - name: Setup Crave CLI
         run: |
-          # Completely clear any old, broken cached tools from the environment
-          rm -rf ${HOME}/bin
           mkdir -p ${HOME}/bin
           
-          # Use the official Crave setup pipeline utility
-          curl -s https://githubusercontent.com | bash -s --
+          # Force download the latest official compiled binary straight from the release assets page
+          curl -sLo ${HOME}/bin/crave https://github.com
           
-          # The official installer puts the working binary right in your folder root
-          if [ -f crave ]; then
-            mv crave ${HOME}/bin/
+          # Fallback check if assets name patterns shifted slightly on upstream repo
+          if [ ! -s ${HOME}/bin/crave ]; then
+            curl -sLo ${HOME}/bin/crave https://github.com
           fi
           
           chmod +x ${HOME}/bin/crave
