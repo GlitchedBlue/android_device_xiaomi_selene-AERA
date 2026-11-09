@@ -15,10 +15,15 @@ jobs:
 
       - name: Setup Crave CLI
         run: |
+          # 1. Clean up and eliminate any problematic repo-committed files out of path
+          rm -f crave
           rm -rf ${HOME}/bin
           mkdir -p ${HOME}/bin
-          # Download pure official release file directly to binary location without script interpretation
+          
+          # 2. Use a completely independent direct curl connection to pull the clean Linux binary
           curl -sLo ${HOME}/bin/crave https://github.com
+          
+          # 3. Securely apply structural paths
           chmod +x ${HOME}/bin/crave
           echo "${HOME}/bin" >> $GITHUB_PATH
 
@@ -35,25 +40,20 @@ jobs:
 
       - name: Initialize Crave Workspace
         run: |
-          crave clone create --project aera-recovery-selene || true
-
-      - name: Purge Corrupt Remote Workspace Binaries
-        run: |
-          # Aggressively deletes any old webpage/HTML files caught in your remote cloud tree
-          crave run -- "rm -rf .repo/local_manifests crave build-aera-selene.sh device/xiaomi/selene/crave" || true
+          ${HOME}/bin/crave clone create --project aera-recovery-selene || true
 
       - name: Setup Manifest
         run: |
-          crave run -- "mkdir -p .repo/local_manifests"
-          curl -sL https://githubusercontent.com | crave run -- "cat > .repo/local_manifests/aera.xml"
+          ${HOME}/bin/crave run -- "mkdir -p .repo/local_manifests"
+          curl -sL https://githubusercontent.com | ${HOME}/bin/crave run -- "cat > .repo/local_manifests/aera.xml"
 
       - name: Sync and Compile
         run: |
-          crave run -- "repo sync -c -j\$(nproc --all) --force-sync --no-clone-bundle --no-tags && chmod +x device/xiaomi/selene/build-aera-selene.sh && ./device/xiaomi/selene/build-aera-selene.sh"
+          ${HOME}/bin/crave run -- "repo sync -c -j\$(nproc --all) --force-sync --no-clone-bundle --no-tags && chmod +x device/xiaomi/selene/build-aera-selene.sh && ./device/xiaomi/selene/build-aera-selene.sh"
 
       - name: Pull Image
         run: |
-          crave pull out/target/product/selene/AERA-R1.0-Alpha-Unofficial-selene.img || crave pull out/target/product/selene/AERA-*.img
+          ${HOME}/bin/crave pull out/target/product/selene/AERA-R1.0-Alpha-Unofficial-selene.img || ${HOME}/bin/crave pull out/target/product/selene/AERA-*.img
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
