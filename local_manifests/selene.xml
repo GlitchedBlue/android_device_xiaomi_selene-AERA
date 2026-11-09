@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+    Local manifest for building AERA Recovery on the Xiaomi Redmi 10 (selene).
+
+    AERA does not ship device trees in its common manifest. Use this file only
+    if the device tree lives in its own git repository. If you are building from
+    this folder directly, `build-aera-selene.sh` copies the tree into the
+    checkout for you and you do not need this file.
+
+    Replace YOUR_GITHUB_USER with the account that hosts the tree, then place
+    this file at .repo/local_manifests/selene.xml inside the AERA checkout.
+-->
+<manifest>
+    <project path="device/xiaomi/selene"
+             name="YOUR_GITHUB_USER/android_device_xiaomi_selene-AERA"
+             remote="github"
+             revision="aera-16.0" />
+</manifest>

@@ -1,0 +1,14 @@
+# Build/source working directories (not part of the device tree)
+_src/
+out/
+*.zip
+
+# Editor/OS noise
+.DS_Store
+Thumbs.db
+
+# Never commit credentials
+.gh_token
+*.token
+.env
+.env.*

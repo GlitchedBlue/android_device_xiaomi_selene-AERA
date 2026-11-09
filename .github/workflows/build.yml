@@ -1,0 +1,35 @@
+name: Build AERA Recovery for selene
+
+# A full AERA Android 16 checkout needs roughly 300 GB of disk and 16-32 GB of
+# RAM. GitHub-hosted runners do not have that. Use a self-hosted Linux runner
+# (or a larger hosted runner) with the labels below, or run
+# build-aera-selene.sh on your own machine.
+on:
+  workflow_dispatch:
+  push:
+    branches: [ aera-16.0, main ]
+
+jobs:
+  build:
+    runs-on: [ self-hosted, linux, aera ]
+    timeout-minutes: 720
+
+    steps:
+      - name: Check out device tree
+        uses: actions/checkout@v4
+        with:
+          path: device-tree
+
+      - name: Build
+        run: |
+          chmod +x device-tree/build-aera-selene.sh
+          JOBS="$(nproc --all)" device-tree/build-aera-selene.sh
+
+      - name: Upload image
+        uses: actions/upload-artifact@v4
+        with:
+          name: AERA-selene
+          path: |
+            ~/android/AERA_16.0/out/target/product/selene/AERA-*.img
+            ~/android/AERA_16.0/out/target/product/selene/boot.img
+          if-no-files-found: error
