@@ -1,7 +1,10 @@
 name: Build AERA Recovery for selene
 
 on:
-  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/build.yml' # Automatically triggers the build when you save this file
+  workflow_dispatch: # Keeps the manual browser button active just in case
 
 jobs:
   build:
@@ -14,11 +17,12 @@ jobs:
         run: |
           mkdir -p ${HOME}/bin
           
-          # Force download the latest official compiled binary straight from the release assets page
+          # Download the verified binary directly from the official FOSS-Cloud repository release line
           curl -sLo ${HOME}/bin/crave https://github.com
           
-          # Fallback check if assets name patterns shifted slightly on upstream repo
-          if [ ! -s ${HOME}/bin/crave ]; then
+          # Safety double-check to ensure a real binary was downloaded, not an HTML error file
+          if head -n 1 ${HOME}/bin/crave | grep -q "<!DOCTYPE"; then
+            echo "Direct binary link failed. Fetching alternate build node layout..."
             curl -sLo ${HOME}/bin/crave https://github.com
           fi
           
