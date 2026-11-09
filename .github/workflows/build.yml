@@ -3,8 +3,8 @@ name: Build AERA Recovery for selene
 on:
   push:
     paths:
-      - '.github/workflows/build.yml' # Automatically triggers the build when you save this file
-  workflow_dispatch: # Keeps the manual browser button active just in case
+      - '.github/workflows/build.yml'
+  workflow_dispatch:
 
 jobs:
   build:
@@ -15,17 +15,10 @@ jobs:
 
       - name: Setup Crave CLI
         run: |
+          rm -rf ${HOME}/bin
           mkdir -p ${HOME}/bin
-          
-          # Download the verified binary directly from the official FOSS-Cloud repository release line
+          # Download pure official release file directly to binary location without script interpretation
           curl -sLo ${HOME}/bin/crave https://github.com
-          
-          # Safety double-check to ensure a real binary was downloaded, not an HTML error file
-          if head -n 1 ${HOME}/bin/crave | grep -q "<!DOCTYPE"; then
-            echo "Direct binary link failed. Fetching alternate build node layout..."
-            curl -sLo ${HOME}/bin/crave https://github.com
-          fi
-          
           chmod +x ${HOME}/bin/crave
           echo "${HOME}/bin" >> $GITHUB_PATH
 
@@ -43,6 +36,11 @@ jobs:
       - name: Initialize Crave Workspace
         run: |
           crave clone create --project aera-recovery-selene || true
+
+      - name: Purge Corrupt Remote Workspace Binaries
+        run: |
+          # Aggressively deletes any old webpage/HTML files caught in your remote cloud tree
+          crave run -- "rm -rf .repo/local_manifests crave build-aera-selene.sh device/xiaomi/selene/crave" || true
 
       - name: Setup Manifest
         run: |
