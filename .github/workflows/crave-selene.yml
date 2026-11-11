@@ -125,20 +125,35 @@ jobs:
       # ---------------------------------------------------------------------
       # Crave workspace
       # ---------------------------------------------------------------------
-      # `crave run` needs a local *clone*: a directory registered against a
-      # project id. Without one it fails with
-      #   could not get project information for <path>
-      # The clone also snapclones the project's sources, so the build node
-      # starts from an already-synced Android 16 tree.
-      - name: Create the Crave workspace
+      # `crave run` works out which project a directory belongs to from the
+      # local .repo manifest, so a shallow `repo init` of the base project's
+      # manifest is required. Nothing is synced here - the build node does the
+      # real sync.
+      - name: Prepare the Crave workspace
+        env:
+          BASE_MANIFEST: ${{ vars.CRAVE_BASE_MANIFEST || 'https://github.com/accupara/los23.2.git' }}
+          BASE_BRANCH: ${{ vars.CRAVE_BASE_BRANCH || 'lineage-23.2' }}
         run: |
           set -uo pipefail
           WS="${HOME}/crave-ws"
           echo "CRAVE_WS=${WS}" >> "$GITHUB_ENV"
-          crave -n clone destroy -y "$WS" >/dev/null 2>&1 || true
-          echo "Creating a clone of project ${CRAVE_PROJECT_ID} at ${WS}"
-          crave -n clone create --projectID "${CRAVE_PROJECT_ID}" "$WS"
-          ls -la "$WS" | head -20
+          mkdir -p "$WS" "$HOME/bin"
+
+          if ! command -v repo >/dev/null 2>&1; then
+            curl -fsSL https://storage.googleapis.com/git-repo-downloads/repo -o "$HOME/bin/repo"
+            chmod +x "$HOME/bin/repo"
+            echo "$HOME/bin" >> "$GITHUB_PATH"
+            export PATH="$HOME/bin:$PATH"
+          fi
+
+          git config --global user.name "AERA Builder"
+          git config --global user.email "builder@localhost"
+          git config --global --add safe.directory '*'
+
+          cd "$WS"
+          echo "repo init -u ${BASE_MANIFEST} -b ${BASE_BRANCH}"
+          repo init -u "${BASE_MANIFEST}" -b "${BASE_BRANCH}" --depth=1 --no-repo-verify
+          ls -a "$WS" | head -20
 
       # ---------------------------------------------------------------------
       # Remote build
@@ -159,6 +174,7 @@ jobs:
           echo "Starting Crave job on project ${CRAVE_PROJECT_ID}"
           echo "Watch it at https://foss.crave.io/app/#/build"
           crave -n run \
+            --projectID "${CRAVE_PROJECT_ID}" \
             --no-artifacts \
             --no-patch \
             ${CLEAN_FLAG} \
@@ -193,11 +209,3 @@ jobs:
           set -uo pipefail
           cd "${CRAVE_WS}" 2>/dev/null || exit 0
           timeout 120 crave -n getlog || true
-
-      # Crave asks for `crave clone destroy` rather than deleting the folder.
-      - name: Destroy the Crave workspace
-        if: always()
-        continue-on-error: true
-        run: |
-          set -uo pipefail
-          timeout 180 crave -n clone destroy -y "${CRAVE_WS}" || true
