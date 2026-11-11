@@ -20,7 +20,7 @@ on:
     branches:
       - aera-16.0
     paths:
-      - '.github/workflows/build.yml'
+      - '.github/workflows/crave-selene.yml'
       - 'scripts/crave-build.sh'
       - 'device/**'
 
@@ -50,12 +50,20 @@ jobs:
       - name: Install the Crave CLI
         run: |
           set -euo pipefail
-          # Piping keeps stdin a pipe, which makes get_crave.sh skip its
-          # interactive prompt and leave ./crave in the current directory.
-          curl -s https://raw.githubusercontent.com/accupara/crave/master/get_crave.sh | bash -s --
           mkdir -p "$HOME/bin"
-          mv ./crave "$HOME/bin/crave"
+          # get_crave.sh is interactive and its stdin check misfires under
+          # GitHub's bash -e, so fetch the release binary directly instead.
+          TAG="$(curl -fsSL https://api.github.com/repos/accupara/crave/releases/latest \
+                 | python3 -c 'import json,sys; print(json.load(sys.stdin)["tag_name"])')" || true
+          if [ -z "${TAG:-}" ]; then TAG="0.2-7183"; fi
+          URL="https://github.com/accupara/crave/releases/download/${TAG}/crave-${TAG}-linux-amd64.bin"
+          echo "Downloading $URL"
+          curl -fsSL "$URL" -o "$HOME/bin/crave"
           chmod +x "$HOME/bin/crave"
+          if [ "$(head -c 4 "$HOME/bin/crave" | od -An -tx1 | tr -d ' \n')" != "7f454c46" ]; then
+            echo "::error::the downloaded file is not an ELF binary"
+            exit 1
+          fi
           echo "$HOME/bin" >> "$GITHUB_PATH"
           "$HOME/bin/crave" version
 
