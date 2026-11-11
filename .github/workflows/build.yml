@@ -1,59 +1,143 @@
-name: Build AERA Recovery for selene
+name: Build AERA Recovery (selene)
+
+# The compile runs on Crave's servers. This workflow only drives the Crave
+# CLI, so it fits comfortably on a stock ubuntu-latest runner (no 300 GB disk
+# needed locally) - the only thing uploaded is a small shell script.
 
 on:
+  workflow_dispatch:
+    inputs:
+      project_id:
+        description: 'Crave project ID to run the job on (see the "List Crave projects" step)'
+        required: false
+        default: ''
+      clean:
+        description: 'Wipe the workspace and do a full sync'
+        type: boolean
+        required: false
+        default: false
   push:
+    branches:
+      - aera-16.0
     paths:
       - '.github/workflows/build.yml'
-  workflow_dispatch:
+      - 'scripts/crave-build.sh'
+      - 'device/**'
+
+permissions:
+  contents: write
+  actions: read
+
+concurrency:
+  group: aera-selene-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   build:
+    name: Build on Crave
     runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    env:
+      CRAVE_PROJECT_ID: ${{ github.event.inputs.project_id || vars.CRAVE_PROJECT_ID || '99' }}
+      CLEAN: ${{ github.event.inputs.clean == 'true' && '1' || '0' }}
+      GH_REPO: ${{ github.repository }}
+      GH_BRANCH: ${{ github.ref_name }}
+
     steps:
-      - name: Checkout device tree
+      - name: Check out the device tree
         uses: actions/checkout@v4
 
-      - name: Setup Crave CLI
+      # ---------------------------------------------------------------------
+      # Crave CLI
+      # ---------------------------------------------------------------------
+      - name: Install the Crave CLI
         run: |
-          rm -rf ${HOME}/bin
-          mkdir -p ${HOME}/bin
-          
-          # Download the stable, production binary directly from the official FOSS-Cloud mirror
-          curl -sLo ${HOME}/bin/crave https://github.com
-          
-          chmod +x ${HOME}/bin/crave
-          echo "${HOME}/bin" >> $GITHUB_PATH
+          set -euo pipefail
+          # Piping keeps stdin a pipe, which makes get_crave.sh skip its
+          # interactive prompt and leave ./crave in the current directory.
+          curl -s https://raw.githubusercontent.com/accupara/crave/master/get_crave.sh | bash -s --
+          mkdir -p "$HOME/bin"
+          mv ./crave "$HOME/bin/crave"
+          chmod +x "$HOME/bin/crave"
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+          "$HOME/bin/crave" version
 
-      - name: Authenticate Crave
+      - name: Write crave.conf
+        env:
+          CRAVE_USERNAME: ${{ secrets.CRAVE_USERNAME }}
+          CRAVE_TOKEN: ${{ secrets.CRAVE_TOKEN }}
         run: |
-          mkdir -p ${HOME}/.crave
-          cat <<EOF > ${HOME}/.crave/crave.conf
+          set -euo pipefail
+          if [ -z "${CRAVE_USERNAME:-}" ] || [ -z "${CRAVE_TOKEN:-}" ]; then
+            echo "::error::CRAVE_USERNAME / CRAVE_TOKEN secrets are not set"
+            exit 1
+          fi
+          cat > "$HOME/crave.conf" <<EOF
           {
-            "username": "${{ secrets.CRAVE_USERNAME }}",
-            "auth_token": "${{ secrets.CRAVE_TOKEN }}",
-            "project": "aera-recovery-selene"
+            "username": "${CRAVE_USERNAME}",
+            "headers": {
+              "Content-Type": "application/json",
+              "Authorization": "${CRAVE_TOKEN}",
+              "User-Agent": "Crave"
+            },
+            "projects": [],
+            "server": "https://foss.crave.io/api"
           }
           EOF
+          python3 -c 'import json,sys; json.load(open(sys.argv[1])); print("crave.conf is valid JSON")' "$HOME/crave.conf"
 
-      - name: Initialize Crave Workspace
+      - name: List Crave projects
+        continue-on-error: true
+        run: crave -n list || true
+
+      # ---------------------------------------------------------------------
+      # Remote build
+      # ---------------------------------------------------------------------
+      - name: Build on Crave
+        env:
+          # The built-in token can read this repo and expires with the job,
+          # so nothing long-lived has to be shipped to Crave.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CRAVE_USERNAME: ${{ secrets.CRAVE_USERNAME }}
+          CRAVE_TOKEN: ${{ secrets.CRAVE_TOKEN }}
         run: |
-          ${HOME}/bin/crave clone create --project aera-recovery-selene || true
+          set -uo pipefail
+          SCRIPT_B64="$(base64 -w0 scripts/crave-build.sh)"
+          CLEAN_FLAG=""
+          if [ "${CLEAN}" = "1" ]; then CLEAN_FLAG="--clean"; fi
+          echo "Starting Crave job on project ${CRAVE_PROJECT_ID}"
+          echo "Watch it at https://foss.crave.io/app/#/build"
+          crave -n run \
+            --projectID "${CRAVE_PROJECT_ID}" \
+            --no-artifacts \
+            --no-patch \
+            ${CLEAN_FLAG} \
+            --message "AERA selene ${GITHUB_RUN_ID}" \
+            -- "GH_TOKEN='${GH_TOKEN:-}' GH_REPO='${GH_REPO}' GH_BRANCH='${GH_BRANCH}' bash -c 'echo ${SCRIPT_B64} | base64 -d | bash'"
 
-      - name: Setup Manifest
+      # ---------------------------------------------------------------------
+      # Collect the images
+      # ---------------------------------------------------------------------
+      - name: Pull the built images
+        if: always()
+        continue-on-error: true
         run: |
-          ${HOME}/bin/crave run -- "mkdir -p .repo/local_manifests"
-          curl -sL https://githubusercontent.com | ${HOME}/bin/crave run -- "cat > .repo/local_manifests/aera.xml"
+          set -uo pipefail
+          timeout 90 crave -n pull crave-artifacts || true
+          ls -lhR crave-artifacts 2>/dev/null || echo "nothing was pulled"
 
-      - name: Sync and Compile
-        run: |
-          ${HOME}/bin/crave run -- "repo sync -c -j\$(nproc --all) --force-sync --no-clone-bundle --no-tags && chmod +x device/xiaomi/selene/build-aera-selene.sh && ./device/xiaomi/selene/build-aera-selene.sh"
-
-      - name: Pull Image
-        run: |
-          ${HOME}/bin/crave pull out/target/product/selene/AERA-R1.0-Alpha-Unofficial-selene.img || ${HOME}/bin/crave pull out/target/product/selene/AERA-*.img
-
-      - name: Upload Artifact
+      - name: Upload the boot image
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: AERA-selene
-          path: AERA-*.img
+          name: AERA-selene-${{ github.run_id }}
+          path: crave-artifacts/**
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Show the Crave log on failure
+        if: failure()
+        continue-on-error: true
+        run: |
+          timeout 90 crave -n getlog || true
