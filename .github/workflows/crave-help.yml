@@ -1,0 +1,51 @@
+name: crave-help
+
+# Temporary diagnostic workflow: dumps the real CLI help of the Crave client
+# so the build workflow can use the correct subcommands.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  help:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Write crave.conf
+        env:
+          CRAVE_USERNAME: ${{ secrets.CRAVE_USERNAME }}
+          CRAVE_TOKEN: ${{ secrets.CRAVE_TOKEN }}
+        run: |
+          set -euo pipefail
+          cat > "$HOME/crave.conf" <<EOF
+          {
+            "username": "${CRAVE_USERNAME}",
+            "headers": {
+              "Content-Type": "application/json",
+              "Authorization": "${CRAVE_TOKEN}",
+              "User-Agent": "Crave"
+            },
+            "projects": [],
+            "server": "https://foss.crave.io/api"
+          }
+          EOF
+
+      - name: Install crave
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/bin"
+          curl -fsSL https://github.com/accupara/crave/releases/download/0.2-7237/crave-0.2-7237-linux-amd64.bin -o "$HOME/bin/crave"
+          chmod +x "$HOME/bin/crave"
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+          "$HOME/bin/crave" version
+
+      - name: Dump help
+        run: |
+          set -uo pipefail
+          echo "##################### allhelp"
+          timeout 60 crave -n allhelp 2>&1 || true
+          for sub in sync devspace run discard set ssh pull exec stop list; do
+            echo "##################### $sub --help"
+            timeout 60 crave -n "$sub" --help 2>&1 || true
+          done
