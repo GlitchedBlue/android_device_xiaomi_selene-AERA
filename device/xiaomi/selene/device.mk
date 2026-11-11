@@ -6,6 +6,14 @@
 DEVICE_PATH := device/xiaomi/selene
 
 # ---------------------------------------------------------------------------
+# Android 16 prebuilt validation
+# ---------------------------------------------------------------------------
+# The recovery ramdisk ships the stock MediaTek keymaster/gatekeeper/boot HAL
+# binaries, which are built for 4 KiB pages. Android 16 otherwise rejects any
+# prebuilt ELF that is not 16 KiB-page aligned.
+PRODUCT_CHECK_PREBUILT_MAX_PAGE_SIZE := false
+
+# ---------------------------------------------------------------------------
 # A/B / virtual A/B
 # ---------------------------------------------------------------------------
 AB_OTA_POSTINSTALL_CONFIG += \

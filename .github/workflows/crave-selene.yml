@@ -123,6 +123,24 @@ jobs:
           timeout 120 crave -n list || true
 
       # ---------------------------------------------------------------------
+      # Crave workspace
+      # ---------------------------------------------------------------------
+      # `crave run` needs a local *clone*: a directory registered against a
+      # project id. Without one it fails with
+      #   could not get project information for <path>
+      # The clone also snapclones the project's sources, so the build node
+      # starts from an already-synced Android 16 tree.
+      - name: Create the Crave workspace
+        run: |
+          set -uo pipefail
+          WS="${HOME}/crave-ws"
+          echo "CRAVE_WS=${WS}" >> "$GITHUB_ENV"
+          crave -n clone destroy -y "$WS" >/dev/null 2>&1 || true
+          echo "Creating a clone of project ${CRAVE_PROJECT_ID} at ${WS}"
+          crave -n clone create --projectID "${CRAVE_PROJECT_ID}" "$WS"
+          ls -la "$WS" | head -20
+
+      # ---------------------------------------------------------------------
       # Remote build
       # ---------------------------------------------------------------------
       - name: Build on Crave
@@ -134,13 +152,13 @@ jobs:
           CRAVE_TOKEN: ${{ secrets.CRAVE_TOKEN }}
         run: |
           set -uo pipefail
-          SCRIPT_B64="$(base64 -w0 scripts/crave-build.sh)"
+          cd "${CRAVE_WS}"
+          SCRIPT_B64="$(base64 -w0 "${GITHUB_WORKSPACE}/scripts/crave-build.sh")"
           CLEAN_FLAG=""
           if [ "${CLEAN}" = "1" ]; then CLEAN_FLAG="--clean"; fi
           echo "Starting Crave job on project ${CRAVE_PROJECT_ID}"
           echo "Watch it at https://foss.crave.io/app/#/build"
           crave -n run \
-            --projectID "${CRAVE_PROJECT_ID}" \
             --no-artifacts \
             --no-patch \
             ${CLEAN_FLAG} \
@@ -155,6 +173,7 @@ jobs:
         continue-on-error: true
         run: |
           set -uo pipefail
+          cd "${CRAVE_WS}" 2>/dev/null || exit 0
           timeout 180 crave -n pull crave-artifacts || true
           ls -lhR crave-artifacts 2>/dev/null || echo "nothing was pulled"
 
@@ -172,4 +191,13 @@ jobs:
         continue-on-error: true
         run: |
           set -uo pipefail
+          cd "${CRAVE_WS}" 2>/dev/null || exit 0
           timeout 120 crave -n getlog || true
+
+      # Crave asks for `crave clone destroy` rather than deleting the folder.
+      - name: Destroy the Crave workspace
+        if: always()
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          timeout 180 crave -n clone destroy -y "${CRAVE_WS}" || true
