@@ -24,8 +24,13 @@ on:
       - 'scripts/crave-build.sh'
       - 'device/**'
 
+# The build job ships its GITHUB_TOKEN to Crave, and Crave prints it in the
+# job's "Build Commands" panel, which the whole team can read. Keep that token
+# read-only: the only thing the remote node needs it for is cloning this
+# private device tree. Publishing happens in a second job that never leaves
+# GitHub.
 permissions:
-  contents: write
+  contents: read
   actions: read
 
 jobs:
@@ -158,10 +163,20 @@ jobs:
       # ---------------------------------------------------------------------
       # Remote build
       # ---------------------------------------------------------------------
+      # A cancelled workflow leaves its Crave job queued or running on the
+      # server, and Crave only allows one job per workspace. Clear the way
+      # before starting a new one.
+      - name: Stop any job left on the workspace
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          cd "${CRAVE_WS}" 2>/dev/null || exit 0
+          timeout 120 crave -n stop --all --force || true
+
       - name: Build on Crave
         env:
-          # The built-in token can read this repo and expires with the job,
-          # so nothing long-lived has to be shipped to Crave.
+          # Read-only (see `permissions:` above) and short-lived: it dies with
+          # this job. The node uses it only to clone the private device tree.
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           CRAVE_USERNAME: ${{ secrets.CRAVE_USERNAME }}
           CRAVE_TOKEN: ${{ secrets.CRAVE_TOKEN }}
@@ -179,18 +194,26 @@ jobs:
             --no-patch \
             ${CLEAN_FLAG} \
             --message "AERA selene ${GITHUB_RUN_ID}" \
-            -- "GH_TOKEN='${GH_TOKEN:-}' GH_REPO='${GH_REPO}' GH_BRANCH='${GH_BRANCH}' RUN_ID='${GITHUB_RUN_ID}' bash -c 'echo ${SCRIPT_B64} | base64 -d | bash'"
+            -- "GH_TOKEN='${GH_TOKEN:-}' GH_REPO='${GH_REPO}' GH_BRANCH='${GH_BRANCH}' bash -c 'echo ${SCRIPT_B64} | base64 -d | bash'"
 
       # ---------------------------------------------------------------------
       # Collect the images
       # ---------------------------------------------------------------------
+      # The workspace on this runner carries the same path and hostname that
+      # the Crave job used, so `crave pull` fetches what the build left in
+      # crave-artifacts/. It is retried because the workspace can take a
+      # moment to settle after the job exits.
       - name: Pull the built images
         if: always()
         continue-on-error: true
         run: |
           set -uo pipefail
           cd "${CRAVE_WS}" 2>/dev/null || exit 0
-          timeout 180 crave -n pull crave-artifacts || true
+          for attempt in 1 2 3; do
+            echo "--- crave pull (attempt ${attempt})"
+            timeout 300 crave -n pull crave-artifacts && break
+            sleep 20
+          done
           ls -lhR crave-artifacts 2>/dev/null || echo "nothing was pulled"
 
       - name: Upload the boot image
@@ -209,3 +232,51 @@ jobs:
           set -uo pipefail
           cd "${CRAVE_WS}" 2>/dev/null || exit 0
           timeout 120 crave -n getlog || true
+
+  # ---------------------------------------------------------------------------
+  # Publish
+  # ---------------------------------------------------------------------------
+  # Releases are created here rather than on the build node: this job has a
+  # write-scoped token, and that token never leaves GitHub.
+  publish:
+    name: Publish the release
+    needs: build
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      actions: read
+
+    steps:
+      - name: Download the built images
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: AERA-selene-${{ github.run_id }}
+          path: images
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: aera-selene-${{ github.run_id }}
+        run: |
+          set -uo pipefail
+          mapfile -t IMAGES < <(find images -type f -name '*.img' 2>/dev/null)
+          if [ "${#IMAGES[@]}" -eq 0 ]; then
+            echo "::warning::no images were collected - nothing to publish"
+            exit 0
+          fi
+          printf 'asset: %s\n' "${IMAGES[@]}"
+
+          if ! gh release view "$TAG" --repo "$GH_REPO" >/dev/null 2>&1; then
+            gh release create "$TAG" \
+              --repo "$GH_REPO" \
+              --title "AERA selene ${GITHUB_RUN_ID}" \
+              --notes "Automatic AERA Recovery (selene) build from GitHub Actions run ${GITHUB_RUN_ID}." \
+              --prerelease
+          fi
+
+          gh release upload "$TAG" "${IMAGES[@]}" --repo "$GH_REPO" --clobber
+          echo "published https://github.com/${GH_REPO}/releases/tag/${TAG}"

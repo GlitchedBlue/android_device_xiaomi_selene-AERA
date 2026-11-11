@@ -93,7 +93,83 @@ Use `mka clean` (or delete `out/target/product/selene`) after changing
 | Out of memory / `ninja` killed | Lower `-j` (e.g. `-j4`) and add swap. |
 | `repo: command not found` | Install the `repo` launcher (see the AOSP docs) or `apt install repo`. |
 
-## CI
+## CI: building on Crave from GitHub Actions
 
-`.github/workflows/build.yml` is provided for a **self-hosted** Linux runner.
-GitHub-hosted runners do not have enough disk or RAM for a full AERA build.
+`.github/workflows/crave-selene.yml` compiles **on Crave's build nodes**, not on
+the GitHub runner. The runner only installs the Crave CLI and streams a job, so
+a stock `ubuntu-latest` machine (4 vCPU / 16 GB / 14 GB disk) is enough — the
+~300 GB tree never touches it.
+
+### One-time setup
+
+1. Add two repository secrets (Settings → Secrets and variables → Actions):
+
+   | Secret | Value |
+   | --- | --- |
+   | `CRAVE_USERNAME` | your `foss.crave.io` username |
+   | `CRAVE_TOKEN` | the API token from the Crave dashboard |
+
+2. Pick a **base project**. AERA is Android 16, so use an Android 16 project:
+
+   | Project ID | Base project |
+   | --- | --- |
+   | `99` | LineageOS 23.2 (default) |
+   | `82` | PixelOS 16 |
+
+   The `List Crave projects` step in the run prints every project ID you can
+   use. Override the default either with the `project_id` workflow input or a
+   repository **variable** named `CRAVE_PROJECT_ID`.
+
+   If you change the project, also set the matching manifest, because Crave
+   matches the local `.repo` against the project:
+
+   | Variable | Default |
+   | --- | --- |
+   | `CRAVE_BASE_MANIFEST` | `https://github.com/accupara/los23.2.git` |
+   | `CRAVE_BASE_BRANCH` | `lineage-23.2` |
+
+### Running
+
+Actions → *Build AERA Recovery (selene)* → **Run workflow**, or push to
+`aera-16.0`.
+
+The workflow prepares a workspace directory with a shallow `repo init` of the
+base project's manifest — `crave run` works out which project a directory
+belongs to from that `.repo`, and refuses to start without one
+(`could not get project information for <path>`). Then it runs
+`scripts/crave-build.sh` on the build node, which follows Crave's documented
+*unsupported ROM* recipe:
+
+```bash
+repo init -u https://github.com/AERA-Recovery/android_manifest.git -b aera-16.0
+/opt/crave/resync.sh
+# copy device/xiaomi/selene in
+source build/envsetup.sh
+lunch twrp_selene-bp2a-eng
+mka adbd bootimage
+```
+
+The finished images are left in `crave-artifacts/` inside the Crave workspace.
+The runner pulls them back with `crave pull` (same path and hostname the job
+used) and a separate `publish` job uploads them to a GitHub **release** tagged
+`aera-selene-<run id>`.
+
+It never runs `rm -rf *` — Crave bans accounts that do.
+
+The same images are also attached to the run as the `AERA-selene-<run id>`
+workflow artifact.
+
+### Token exposure on Crave
+
+Crave shows the full `crave run` command line in its dashboard, so any secret on
+that line is readable by everyone on the Crave team. The build job therefore
+runs with `permissions: contents: read`: the token the node receives can only
+read this private repo and expires with the job. The write-scoped token exists
+only in the `publish` job, which stays on GitHub.
+
+### Why not just `ubuntu-latest`?
+
+GitHub-hosted runners have ~14 GB of disk. AERA's manifest is a full Android 16
+tree (tens of GB of source plus `out/`), so a local sync dies with
+`No space left on device` long before compiling. Crave provides the disk, RAM
+and Android build image; GitHub provides the trigger and the artifact storage.

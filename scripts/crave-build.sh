@@ -7,6 +7,10 @@
 #   crave run --projectID <id> --no-artifacts --no-patch -- \
 #     "GH_TOKEN=... bash -c 'echo <base64> | base64 -d | bash'"
 #
+# The GH_TOKEN handed over is read-only and expires with the workflow job; it
+# is only used to clone the private device tree. Crave prints the command in
+# its dashboard, so never pass anything with write access.
+#
 # It follows Crave's documented "unsupported ROM" recipe:
 #   - start from the closest supported base project (Android 16)
 #   - repo init the AERA manifest over it
@@ -152,53 +156,10 @@ done
 ls -lh "$ARTIFACT_DIR" 2>/dev/null || true
 
 # ---------------------------------------------------------------------------
-# 6. Publish the images as GitHub release assets
+# 6. Done
 # ---------------------------------------------------------------------------
-# `crave pull` has to be run from the workspace that produced the build, which
-# the GitHub runner does not have. Uploading straight from the build node means
-# a finished build is never lost.
-publish_release() {
-    [ -n "${GH_TOKEN:-}" ] || return 0
-    [ -n "${RUN_ID:-}" ] || return 0
-    [ -n "$(ls -A "$ARTIFACT_DIR" 2>/dev/null)" ] || return 0
-
-    local tag="aera-selene-${RUN_ID}"
-    local api="https://api.github.com/repos/${GH_REPO}"
-    local json rel upload f
-
-    json="$(mktemp)"
-    printf '{"tag_name":"%s","name":"AERA selene build %s","body":"Automatic build from GitHub Actions run %s"}' \
-        "$tag" "$RUN_ID" "$RUN_ID" > "$json"
-
-    rel="$(curl -sS -X POST \
-        -H "Authorization: token ${GH_TOKEN}" \
-        -H "Accept: application/vnd.github+json" \
-        -H "Content-Type: application/json" \
-        --data-binary "@${json}" "${api}/releases" 2>&1)"
-    rm -f "$json"
-
-    upload="$(printf '%s' "$rel" | sed -n 's/.*"upload_url": *"\([^"]*\)".*/\1/p')"
-    upload="${upload%%\{*}"
-    if [ -z "$upload" ]; then
-        echo "could not create the release: $rel"
-        return 1
-    fi
-
-    for f in "$ARTIFACT_DIR"/*.img; do
-        [ -f "$f" ] || continue
-        if curl -sS -X POST \
-            -H "Authorization: token ${GH_TOKEN}" \
-            -H "Content-Type: application/octet-stream" \
-            --data-binary "@$f" "${upload}?name=$(basename "$f")" >/dev/null; then
-            echo "  uploaded $(basename "$f")"
-        else
-            echo "  failed to upload $(basename "$f")"
-        fi
-    done
-}
-
-banner "Publishing artifacts"
-publish_release || echo "release upload failed - the workflow will try 'crave pull' instead"
-
+# The images are left in crave-artifacts/ inside the workspace; the GitHub
+# runner pulls them with `crave pull` and publishes the release. Nothing is
+# uploaded from here, so the token this script receives can stay read-only.
 banner "Finished $(date -u +%FT%TZ) rc=$build_rc"
 exit "$build_rc"
