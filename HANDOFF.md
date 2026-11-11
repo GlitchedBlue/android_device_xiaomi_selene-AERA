@@ -1,15 +1,17 @@
 # Handoff / current status
 
-Last updated: 2026-11-11 22:20 UTC
+Last updated: 2026-11-11 22:50 UTC
 
 ## What is running right now
 
 A build is live on Crave's servers, driven by GitHub Actions. **It does not need
 this PC.**
 
-- Workflow run: https://github.com/GlitchedBlue/android_device_xiaomi_selene-AERA/actions/runs/43101628666
-- Commit: `916dc51f27f5699db64e0fb4f933334535008dc0`
+- Workflow run: https://github.com/GlitchedBlue/android_device_xiaomi_selene-AERA/actions/runs/43105206570
+- Commit: `7883e164b20a4bed90f3bf3e01c1951b0229ed3f`
 - Job step `Build on Crave` is streaming a Crave job on project **99 (LOS 23.2)**.
+- This run replaced #5 (`43101628666`, commit `916dc51`), which was cancelled
+  because its token had write scope and Crave prints the command line.
 
 When it finishes, the runner pulls the images back with `crave pull` and the
 `publish` job uploads them to a GitHub **release** tagged `aera-selene-<run id>`:
