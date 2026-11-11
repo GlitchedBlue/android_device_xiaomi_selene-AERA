@@ -47,26 +47,8 @@ jobs:
       # ---------------------------------------------------------------------
       # Crave CLI
       # ---------------------------------------------------------------------
-      - name: Install the Crave CLI
-        run: |
-          set -euo pipefail
-          mkdir -p "$HOME/bin"
-          # get_crave.sh is interactive and its stdin check misfires under
-          # GitHub's bash -e, so fetch the release binary directly instead.
-          TAG="$(curl -fsSL https://api.github.com/repos/accupara/crave/releases/latest \
-                 | python3 -c 'import json,sys; print(json.load(sys.stdin)["tag_name"])')" || true
-          if [ -z "${TAG:-}" ]; then TAG="0.2-7183"; fi
-          URL="https://github.com/accupara/crave/releases/download/${TAG}/crave-${TAG}-linux-amd64.bin"
-          echo "Downloading $URL"
-          curl -fsSL "$URL" -o "$HOME/bin/crave"
-          chmod +x "$HOME/bin/crave"
-          if [ "$(head -c 4 "$HOME/bin/crave" | od -An -tx1 | tr -d ' \n')" != "7f454c46" ]; then
-            echo "::error::the downloaded file is not an ELF binary"
-            exit 1
-          fi
-          echo "$HOME/bin" >> "$GITHUB_PATH"
-          "$HOME/bin/crave" version
-
+      # The config is written first so that `crave version` is probed with
+      # credentials available; some releases crash before reading a config.
       - name: Write crave.conf
         env:
           CRAVE_USERNAME: ${{ secrets.CRAVE_USERNAME }}
@@ -91,9 +73,54 @@ jobs:
           EOF
           python3 -c 'import json,sys; json.load(open(sys.argv[1])); print("crave.conf is valid JSON")' "$HOME/crave.conf"
 
+      - name: Install the Crave CLI
+        env:
+          CRAVE_VERSION: ${{ vars.CRAVE_VERSION }}
+        run: |
+          set -uo pipefail
+          mkdir -p "$HOME/bin"
+
+          # 0.2-7237 (the current "latest") aborts every subcommand with
+          #   Caught unknown error: 'Namespace' object has no attribute 'amsfeaturecap'
+          # so probe a few releases and keep the first one that actually runs.
+          CANDIDATES="${CRAVE_VERSION:-} 0.2-7237 0.2-7226 0.2-7220 0.2-7210 0.2-7193 0.2-7183"
+          WORKING=""
+          for V in $CANDIDATES; do
+            [ -n "$V" ] || continue
+            URL="https://github.com/accupara/crave/releases/download/${V}/crave-${V}-linux-amd64.bin"
+            echo "--- trying crave ${V}"
+            if ! curl -fsSL "$URL" -o "$HOME/bin/crave"; then
+              echo "    download failed"
+              continue
+            fi
+            chmod +x "$HOME/bin/crave"
+            if [ "$(head -c 4 "$HOME/bin/crave" | od -An -tx1 | tr -d ' \n')" != "7f454c46" ]; then
+              echo "    not an ELF binary"
+              continue
+            fi
+            OUT="$("$HOME/bin/crave" version 2>&1)"
+            RC=$?
+            echo "    exit=${RC}"
+            echo "    output=${OUT}"
+            if [ "$RC" -eq 0 ]; then
+              WORKING="$V"
+              break
+            fi
+          done
+
+          if [ -z "$WORKING" ]; then
+            echo "::error::no Crave release could be started on this runner"
+            exit 1
+          fi
+
+          echo "Using crave ${WORKING}"
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+
       - name: List Crave projects
         continue-on-error: true
-        run: crave -n list || true
+        run: |
+          set -uo pipefail
+          timeout 120 crave -n list || true
 
       # ---------------------------------------------------------------------
       # Remote build
@@ -118,7 +145,7 @@ jobs:
             --no-patch \
             ${CLEAN_FLAG} \
             --message "AERA selene ${GITHUB_RUN_ID}" \
-            -- "GH_TOKEN='${GH_TOKEN:-}' GH_REPO='${GH_REPO}' GH_BRANCH='${GH_BRANCH}' bash -c 'echo ${SCRIPT_B64} | base64 -d | bash'"
+            -- "GH_TOKEN='${GH_TOKEN:-}' GH_REPO='${GH_REPO}' GH_BRANCH='${GH_BRANCH}' RUN_ID='${GITHUB_RUN_ID}' bash -c 'echo ${SCRIPT_B64} | base64 -d | bash'"
 
       # ---------------------------------------------------------------------
       # Collect the images
@@ -128,7 +155,7 @@ jobs:
         continue-on-error: true
         run: |
           set -uo pipefail
-          timeout 90 crave -n pull crave-artifacts || true
+          timeout 180 crave -n pull crave-artifacts || true
           ls -lhR crave-artifacts 2>/dev/null || echo "nothing was pulled"
 
       - name: Upload the boot image
@@ -144,4 +171,5 @@ jobs:
         if: failure()
         continue-on-error: true
         run: |
-          timeout 90 crave -n getlog || true
+          set -uo pipefail
+          timeout 120 crave -n getlog || true
