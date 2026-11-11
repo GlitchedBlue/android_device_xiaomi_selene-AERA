@@ -28,10 +28,6 @@ permissions:
   contents: write
   actions: read
 
-concurrency:
-  group: aera-selene-${{ github.ref }}
-  cancel-in-progress: false
-
 jobs:
   build:
     name: Build on Crave
