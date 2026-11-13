@@ -101,13 +101,20 @@ device ports use.
 
 Two things make it fit on a stock runner:
 
-1. **`easimon/maximize-build-space`** pools the root disk and the temp disk into
-   one ~60–115 GB volume mounted over `$GITHUB_WORKSPACE`. Without it the runner
-   has ~14 GB free and the sync dies with `ENOSPC`.
+1. **`ubuntu-24.04`, not 22.04.** The 24.04 public image has a **145 GB** root
+   disk. That is measured, not assumed — a successful AzzyC run shows
+   `/dev/root 145G` in its `df -h`. On 22.04 the runner is much smaller, and
+   `easimon/maximize-build-space` only pooled it to **84 GB**, i.e. it was
+   actively costing space. Do not add it back.
 2. **The repository must be public.** A private repo gets a 2 vCPU / 8 GB
    runner and Soong is OOM-killed about 48 minutes into the build. Public gets
    4 vCPU / 16 GB and unlimited Actions minutes. Every AERA port that produces
    images is public for exactly this reason.
+
+`rokibhasansagar/slimhub_actions` deletes the preinstalled SDKs, CLR, Haskell
+and CodeQL that this build never touches, and `pierotofy/set-swap-space` adds
+30 GB of swap so `-j$(nproc)` on 4 cores survives Soong's peak RSS in 16 GB of
+RAM.
 
 ### Running
 
@@ -120,24 +127,31 @@ The job runs:
 repo init --depth=1 -u https://github.com/AERA-Recovery/android_manifest.git -b aera-16.0
 repo sync -c --no-clone-bundle --no-tags --prune -j4
 # copy device/xiaomi/selene in, then:
-rm -rf .repo            # reclaims ~20 GB before the build
+rm -rf .repo            # reclaims ~18 GB before the build
+export AERA_BUILD_DEVICE=selene   # must come BEFORE envsetup is sourced
 source build/envsetup.sh
 lunch twrp_selene-bp2a-eng
 mka adbd bootimage      # falls back to recoveryimage
 ```
 
-Expect **2–2.5 hours** per attempt. The sync is the fragile part: it is retried
+Expect **1.5–2.5 hours** per attempt. The sync is the fragile part: it is retried
 three times with a 45-minute cap, a heartbeat so the runner never goes silent,
 and a free-space guard. `.repo` is deleted before the build because it holds the
 history of ~1000 projects and is worthless once the working tree exists.
 
+The sync alone is ~20 minutes and never changes between attempts, so a typo in
+the board config costs a full round trip. Check config changes carefully.
+
 Images land in a GitHub **release** tagged `aera-selene-<run id>` and as the
-`AERA-selene-<run id>` workflow artifact.
+`AERA-selene-<run id>` workflow artifact. The release step has
+`fail_on_unmatched_files: true`, so a build that produces nothing fails loudly
+instead of publishing an empty release.
 
 ### Tuning
 
 | Knob | Where | Why |
 | --- | --- | --- |
-| `root-reserve-mb` / `temp-reserve-mb` | workflow | Shrinking them makes the action itself fail (`fallocate: invalid length value specified`) |
+| `runs-on` | workflow | `ubuntu-24.04` gives a 145 GB disk; 22.04 does not |
+| `swap-size-gb` | workflow | 30 GB is what makes `-j$(nproc)` survive Soong on 16 GB |
 | `GOMEMLIMIT` | workflow `Build` step | Keeps Soong's Go heap inside the runner's RAM; 12 GiB is safe on 16 GB |
 | `target` input | workflow dispatch | `bootimage` (default, selene is recovery-as-boot), `recoveryimage`, `vendorboot` |

@@ -87,7 +87,11 @@ TW_HAS_NO_RECOVERY_PARTITION := true
 BOARD_USES_METADATA_PARTITION := true
 BOARD_SUPPRESS_SECURE_ERASE := true
 
-PRODUCT_USE_DYNAMIC_PARTITIONS := true
+# PRODUCT_USE_DYNAMIC_PARTITIONS is a *product* variable and is marked
+# readonly by product_config.mk before board_config.mk includes this file.
+# Setting it here is a hard error on Android 16:
+#   error: cannot assign to readonly variable: PRODUCT_USE_DYNAMIC_PARTITIONS
+# It lives in device.mk instead; only the BOARD_* budget belongs here.
 BOARD_SUPER_PARTITION_SIZE := 9126805504
 BOARD_SUPER_PARTITION_GROUPS := xiaomi_dynamic_partitions
 BOARD_XIAOMI_DYNAMIC_PARTITIONS_PARTITION_LIST := system vendor product
@@ -139,10 +143,13 @@ TARGET_RECOVERY_PIXEL_FORMAT := RGBX_8888
 # selene uses MediaTek metadata encryption + FBE v2 (keymaster 4.1 beanpod).
 # The vendor fstab uses fileencryption=...:v2, so TWRP must use the v2
 # fscrypt policy layout.
+#
+# Note the semantics: 1 selects v1, *anything else* selects the v2 path. So a
+# value of 1 here would silently pick the wrong policy for this device.
 AERA_INCLUDE_CRYPTO := true
 AERA_INCLUDE_CRYPTO_FBE := true
 AERA_INCLUDE_FBE_METADATA_DECRYPT := true
-AERA_USE_FSCRYPT_POLICY := 1
+AERA_USE_FSCRYPT_POLICY := 2
 
 # The vendor fstab.mt6768 is required for decryption, so do NOT set
 # AERA_SKIP_ADDITIONAL_FSTAB on this device.
@@ -195,6 +202,8 @@ AERA_INCLUDE_LOGCAT := true
 # Display / input (1080x2400, 440 dpi, fbdev)
 # ---------------------------------------------------------------------------
 AERA_UI_ADAPTIVE_RESOLUTION := true
+AERA_SCREEN_H := 2400
+AERA_STATUS_H := 100
 AERA_BRIGHTNESS_PATH := "/sys/class/leds/lcd-backlight/brightness"
 AERA_DEFAULT_BRIGHTNESS := 600
 AERA_FRAMERATE := 60
@@ -231,5 +240,4 @@ TARGET_SYSTEM_PROP += $(DEVICE_PATH)/system.prop
 AERA_EXCLUDE_APEX := true
 AERA_EXCLUDE_DEFAULT_USB_INIT := true
 AERA_DEFAULT_LANGUAGE := en
-AERA_NO_TREBLE_COMPATIBILITY_CHECK := 1
 AERA_USE_TOOLBOX := true

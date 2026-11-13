@@ -2,13 +2,20 @@ name: Build AERA Recovery (selene)
 
 # AERA for the Xiaomi Redmi 10 (selene), compiled on a GitHub-hosted runner.
 #
-# This is the recipe the other AERA device ports use. Two things make it work:
-#   * easimon/maximize-build-space pools the root disk and the temp disk into
-#     one ~60-115 GB volume mounted over $GITHUB_WORKSPACE. Without it the
-#     runner only has ~14 GB free and the sync dies with ENOSPC.
-#   * The repository MUST be public. A private repo gets a 2 vCPU / 8 GB
-#     runner and Soong is OOM-killed about 48 minutes into the build. Every
-#     successful AERA builder repo is public for exactly this reason.
+# Runner recipe is the one that actually ships AERA images (AzzyC's
+# Action-OFRP-Builder, 14/20 successes at 78-156 min on the same manifest):
+#
+#   * ubuntu-24.04 -- NOT 22.04. The 24.04 public image comes with a 145 GB
+#     root disk. On 22.04 easimon/maximize-build-space pooled us down to 84 GB,
+#     i.e. it was actively costing us space. Do not add it back.
+#   * slimhub deletes the preinstalled SDKs/CLR/Haskell/CodeQL that this build
+#     never touches.
+#   * 30 GB of swap is what lets -j$(nproc) survive Soong's peak RSS on a
+#     16 GB runner.
+#
+# The repository MUST be public. A private repo gets a 2 vCPU / 8 GB runner and
+# Soong is OOM-killed about 48 minutes in. Every AERA builder repo that produces
+# images is public for exactly this reason.
 
 on:
   workflow_dispatch:
@@ -42,7 +49,7 @@ permissions:
 jobs:
   build:
     name: Build AERA for selene
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     timeout-minutes: 350
 
     env:
@@ -57,41 +64,43 @@ jobs:
 
     steps:
       # ---------------------------------------------------------------------
-      # Space
+      # Space / RAM
       # ---------------------------------------------------------------------
-      # The reserves are deliberate. Shrinking them makes the step itself fail
-      # with "fallocate: invalid length value specified" (HIZVOICE/camellia
-      # proved that on their build #6), so do not tune them down.
-      - name: Maximize build space
-        uses: easimon/maximize-build-space@master
+      - name: Cleanup
+        uses: rokibhasansagar/slimhub_actions@main
+
+      - name: Set swap space
+        uses: pierotofy/set-swap-space@master
         with:
-          root-reserve-mb: 16384
-          temp-reserve-mb: 12288
-          swap-size-mb: 8192
-          remove-dotnet: 'true'
-          remove-android: 'true'
-          remove-haskell: 'true'
-          remove-codeql: 'true'
-          remove-docker-images: 'true'
+          swap-size-gb: 30
 
       - name: Show resources
         run: |
           echo "cores: $(nproc)"
-          df -h
+          df -h /
           free -h
 
       # ---------------------------------------------------------------------
       # Toolchain
       # ---------------------------------------------------------------------
+      # OrangeFox's android_build_env.sh is maintained for exactly this job, so
+      # prefer it over a hand-rolled apt list. The apt list stays as a fallback
+      # in case the GitLab raw URL is unreachable.
       - name: Install build dependencies
         run: |
           export DEBIAN_FRONTEND=noninteractive
+          if curl -fsSL -o /tmp/android_build_env.sh \
+               "https://gitlab.com/OrangeFox/misc/scripts/-/raw/master/setup/android_build_env.sh"; then
+            sudo bash /tmp/android_build_env.sh || true
+          fi
+
           sudo apt-get update
           sudo apt-get install -y \
             git-core gnupg flex bison build-essential zip curl zlib1g-dev \
             libc6-dev-i386 libncurses5 lib32ncurses5-dev x11proto-core-dev \
             libx11-dev lib32z1-dev libgl1-mesa-dev libxml2-utils xsltproc \
-            unzip fontconfig python3 python-is-python3 rsync lz4 bc ccache
+            unzip fontconfig python3 python-is-python3 rsync lz4 bc ccache \
+            imagemagick libssl-dev
 
           mkdir -p ~/bin
           curl -s https://storage.googleapis.com/git-repo-downloads/repo > ~/bin/repo
@@ -165,7 +174,7 @@ jobs:
           echo "device tree files: $(find "${DEVICE_PATH}" -type f | wc -l)"
 
       # .repo holds the full git history of ~1000 projects. It is worthless
-      # once the working tree exists, and dropping it reclaims ~20 GB right
+      # once the working tree exists, and dropping it reclaims ~18 GB right
       # before the step that needs the space.
       - name: Drop .repo
         run: |
@@ -188,13 +197,24 @@ jobs:
           ALLOW_MISSING_DEPENDENCIES: "true"
         run: |
           cd "${WORKDIR}"
+          # The wiki is explicit: AERA_BUILD_DEVICE must be set in the calling
+          # shell *before* envsetup is sourced, otherwise another tree's exports
+          # can leak in and the vendorsetup guard never runs for this device.
+          export AERA_BUILD_DEVICE="${DEVICE}"
           set +e
           source build/envsetup.sh
           set -e
 
-          lunch "${LUNCH}" \
-            || lunch "aera_selene-bp2a-eng" \
-            || lunch "twrp_selene-eng"
+          # selene's product is twrp_selene (AndroidProducts.mk) and AERA 16
+          # uses the bp2a release name, so the combo is twrp_selene-bp2a-eng.
+          # The twrp_ prefix is a build product name, not UI branding, and
+          # there is no aera_selene product -- earlier fallbacks to
+          # "aera_selene-bp2a-eng" / "twrp_selene-eng" only produced
+          # "Invalid lunch combo" noise that hid the real error.
+          if ! lunch "${LUNCH}"; then
+            echo "::error::lunch ${LUNCH} failed -- see the make error above"
+            exit 1
+          fi
 
           set +e
           mka adbd "${BUILD_TARGET}"
@@ -249,7 +269,9 @@ jobs:
           tag_name: aera-selene-${{ github.run_id }}
           name: AERA Recovery selene ${{ github.run_id }}
           files: ${{ github.workspace }}/artifacts/*
-          fail_on_unmatched_files: false
+          # Loud failure beats a green run with an empty release -- that is
+          # exactly how run #6 wasted a night.
+          fail_on_unmatched_files: true
           body: |
             AERA Recovery for the Xiaomi Redmi 10 (selene).
 

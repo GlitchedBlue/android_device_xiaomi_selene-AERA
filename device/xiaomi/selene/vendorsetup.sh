@@ -24,11 +24,16 @@ if [ "$1" = "$FDEVICE" ] || [ "$AERA_BUILD_DEVICE" = "$FDEVICE" ]; then
     export AERA_PRODUCT_PREFIX=AERA
     export AERA_BUILD_STATUS=Unofficial
     export AERA_BUILD_TYPE=Alpha
+    export AERA_MAINTAINER="AERA Selene Port"
+    # selene ships a stock Android 11 vendor image under an Android 16 recovery,
+    # so the vendor/treble compatibility assertion would always fail.
+    export AERA_NO_TREBLE_COMPATIBILITY_CHECK=1
     export AERA_VANILLA_BUILD=1
     export AERA_ENABLE_ROOT_MANAGER=0
     export AERA_ALLOW_EARLY_SETTINGS_LOAD=1
-    export AERA_DELETE_AROMAFM=1
-    export AERA_DELETE_MAGISK_ADDON=1
+    # AERA_DELETE_AROMAFM / AERA_DELETE_MAGISK_ADDON were OrangeFox-era switches
+    # and are dead in the Android 16 backend (nothing in aera_config.mk,
+    # aera_build.mk or AERA_A16.sh reads them), so they are not set here.
     export AERA_USE_UPDATED_MAGISKBOOT=1
     export AERA_USE_BUSYBOX_BINARY=1
     export AERA_USE_DATE_BINARY=1
