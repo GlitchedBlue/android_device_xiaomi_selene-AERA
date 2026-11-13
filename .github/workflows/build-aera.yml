@@ -83,24 +83,36 @@ jobs:
       # ---------------------------------------------------------------------
       # Toolchain
       # ---------------------------------------------------------------------
-      # OrangeFox's android_build_env.sh is maintained for exactly this job, so
-      # prefer it over a hand-rolled apt list. The apt list stays as a fallback
-      # in case the GitLab raw URL is unreachable.
+      # OrangeFox's android_build_env.sh is the de-facto standard, but on noble
+      # it is effectively a no-op (it only pulls software-properties-common) --
+      # the ubuntu-24.04 image already carries most of the Android toolchain.
+      # The extras below are therefore filtered by availability: Ubuntu 24.04
+      # dropped the 22.04-era names (libncurses5, lib32ncurses5-dev do not
+      # exist on noble) and one unknown name aborts the whole apt transaction.
       - name: Install build dependencies
         run: |
           export DEBIAN_FRONTEND=noninteractive
+          sudo apt-get update -y
+
           if curl -fsSL -o /tmp/android_build_env.sh \
                "https://gitlab.com/OrangeFox/misc/scripts/-/raw/master/setup/android_build_env.sh"; then
             sudo bash /tmp/android_build_env.sh || true
           fi
 
-          sudo apt-get update
-          sudo apt-get install -y \
-            git-core gnupg flex bison build-essential zip curl zlib1g-dev \
-            libc6-dev-i386 libncurses5 lib32ncurses5-dev x11proto-core-dev \
-            libx11-dev lib32z1-dev libgl1-mesa-dev libxml2-utils xsltproc \
-            unzip fontconfig python3 python-is-python3 rsync lz4 bc ccache \
-            imagemagick libssl-dev
+          WANTED="git-core gnupg flex bison build-essential zip curl zlib1g-dev \
+                  libc6-dev-i386 libncurses-dev lib32ncurses-dev libncurses5 \
+                  lib32ncurses5-dev x11proto-core-dev libx11-dev lib32z1-dev \
+                  libgl1-mesa-dev libxml2-utils xsltproc unzip fontconfig \
+                  python3 python-is-python3 rsync lz4 bc ccache imagemagick libssl-dev"
+          AVAILABLE=""
+          for pkg in $WANTED; do
+            if apt-cache show "$pkg" >/dev/null 2>&1; then
+              AVAILABLE="$AVAILABLE $pkg"
+            else
+              echo "skipping (not packaged here): $pkg"
+            fi
+          done
+          sudo apt-get install -y $AVAILABLE
 
           mkdir -p ~/bin
           curl -s https://storage.googleapis.com/git-repo-downloads/repo > ~/bin/repo
@@ -240,7 +252,9 @@ jobs:
       - name: Collect images
         if: always()
         run: |
-          cd "${WORKDIR}"
+          # An earlier step may have failed before the workdir existed; do not
+          # turn that into a second, confusing error.
+          cd "${WORKDIR}" 2>/dev/null || { echo "no workdir, nothing to collect"; exit 0; }
           mkdir -p "${GITHUB_WORKSPACE}/artifacts"
           ls -lh "out/target/product/${DEVICE}/" 2>/dev/null | head -40 || true
           for f in \
