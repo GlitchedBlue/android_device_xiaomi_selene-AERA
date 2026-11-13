@@ -93,83 +93,51 @@ Use `mka clean` (or delete `out/target/product/selene`) after changing
 | Out of memory / `ninja` killed | Lower `-j` (e.g. `-j4`) and add swap. |
 | `repo: command not found` | Install the `repo` launcher (see the AOSP docs) or `apt install repo`. |
 
-## CI: building on Crave from GitHub Actions
+## CI: building on GitHub Actions
 
-`.github/workflows/crave-selene.yml` compiles **on Crave's build nodes**, not on
-the GitHub runner. The runner only installs the Crave CLI and streams a job, so
-a stock `ubuntu-latest` machine (4 vCPU / 16 GB / 14 GB disk) is enough — the
-~300 GB tree never touches it.
+`.github/workflows/build-aera.yml` compiles AERA directly on a GitHub-hosted
+runner. Crave.io shut down in November 2026, so this is the path the other AERA
+device ports use.
 
-### One-time setup
+Two things make it fit on a stock runner:
 
-1. Add two repository secrets (Settings → Secrets and variables → Actions):
-
-   | Secret | Value |
-   | --- | --- |
-   | `CRAVE_USERNAME` | your `foss.crave.io` username |
-   | `CRAVE_TOKEN` | the API token from the Crave dashboard |
-
-2. Pick a **base project**. AERA is Android 16, so use an Android 16 project:
-
-   | Project ID | Base project |
-   | --- | --- |
-   | `99` | LineageOS 23.2 (default) |
-   | `82` | PixelOS 16 |
-
-   The `List Crave projects` step in the run prints every project ID you can
-   use. Override the default either with the `project_id` workflow input or a
-   repository **variable** named `CRAVE_PROJECT_ID`.
-
-   If you change the project, also set the matching manifest, because Crave
-   matches the local `.repo` against the project:
-
-   | Variable | Default |
-   | --- | --- |
-   | `CRAVE_BASE_MANIFEST` | `https://github.com/accupara/los23.2.git` |
-   | `CRAVE_BASE_BRANCH` | `lineage-23.2` |
+1. **`easimon/maximize-build-space`** pools the root disk and the temp disk into
+   one ~60–115 GB volume mounted over `$GITHUB_WORKSPACE`. Without it the runner
+   has ~14 GB free and the sync dies with `ENOSPC`.
+2. **The repository must be public.** A private repo gets a 2 vCPU / 8 GB
+   runner and Soong is OOM-killed about 48 minutes into the build. Public gets
+   4 vCPU / 16 GB and unlimited Actions minutes. Every AERA port that produces
+   images is public for exactly this reason.
 
 ### Running
 
 Actions → *Build AERA Recovery (selene)* → **Run workflow**, or push to
-`aera-16.0`.
+`aera-16.0` (the workflow triggers on `device/**` and itself).
 
-The workflow prepares a workspace directory with a shallow `repo init` of the
-base project's manifest — `crave run` works out which project a directory
-belongs to from that `.repo`, and refuses to start without one
-(`could not get project information for <path>`). Then it runs
-`scripts/crave-build.sh` on the build node, which follows Crave's documented
-*unsupported ROM* recipe:
+The job runs:
 
 ```bash
-repo init -u https://github.com/AERA-Recovery/android_manifest.git -b aera-16.0
-/opt/crave/resync.sh
-# copy device/xiaomi/selene in
+repo init --depth=1 -u https://github.com/AERA-Recovery/android_manifest.git -b aera-16.0
+repo sync -c --no-clone-bundle --no-tags --prune -j4
+# copy device/xiaomi/selene in, then:
+rm -rf .repo            # reclaims ~20 GB before the build
 source build/envsetup.sh
 lunch twrp_selene-bp2a-eng
-mka adbd bootimage
+mka adbd bootimage      # falls back to recoveryimage
 ```
 
-The finished images are left in `crave-artifacts/` inside the Crave workspace.
-The runner pulls them back with `crave pull` (same path and hostname the job
-used) and a separate `publish` job uploads them to a GitHub **release** tagged
-`aera-selene-<run id>`.
+Expect **2–2.5 hours** per attempt. The sync is the fragile part: it is retried
+three times with a 45-minute cap, a heartbeat so the runner never goes silent,
+and a free-space guard. `.repo` is deleted before the build because it holds the
+history of ~1000 projects and is worthless once the working tree exists.
 
-It never runs `rm -rf *` — Crave bans accounts that do.
+Images land in a GitHub **release** tagged `aera-selene-<run id>` and as the
+`AERA-selene-<run id>` workflow artifact.
 
-The same images are also attached to the run as the `AERA-selene-<run id>`
-workflow artifact.
+### Tuning
 
-### Token exposure on Crave
-
-Crave shows the full `crave run` command line in its dashboard, so any secret on
-that line is readable by everyone on the Crave team. The build job therefore
-runs with `permissions: contents: read`: the token the node receives can only
-read this private repo and expires with the job. The write-scoped token exists
-only in the `publish` job, which stays on GitHub.
-
-### Why not just `ubuntu-latest`?
-
-GitHub-hosted runners have ~14 GB of disk. AERA's manifest is a full Android 16
-tree (tens of GB of source plus `out/`), so a local sync dies with
-`No space left on device` long before compiling. Crave provides the disk, RAM
-and Android build image; GitHub provides the trigger and the artifact storage.
+| Knob | Where | Why |
+| --- | --- | --- |
+| `root-reserve-mb` / `temp-reserve-mb` | workflow | Shrinking them makes the action itself fail (`fallocate: invalid length value specified`) |
+| `GOMEMLIMIT` | workflow `Build` step | Keeps Soong's Go heap inside the runner's RAM; 12 GiB is safe on 16 GB |
+| `target` input | workflow dispatch | `bootimage` (default, selene is recovery-as-boot), `recoveryimage`, `vendorboot` |
