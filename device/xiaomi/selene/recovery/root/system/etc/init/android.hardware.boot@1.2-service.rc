@@ -1,0 +1,30 @@
+# Override of the build-installed android.hardware.boot@1.2-service.rc.
+#
+# The stock MediaTek boot-control HAL prebuilt imports the Android 11
+# android::base::Trim(std::string const&), which Android 16's libbase no longer
+# exports, so dlopen() fails with "cannot locate symbol". libaera_boot_trim
+# re-exports exactly that one symbol.
+#
+# LD_PRELOAD is scoped to this service on purpose. It used to be a global
+# `export` in init.recovery.mt6768.rc pointing at
+# /system/lib64/libaera_boot_trim.so, but a zip installer mounts the system
+# partition over the ramdisk's /system, which made that path vanish and every
+# dynamically linked binary die with:
+#
+#   CANNOT LINK EXECUTABLE "getprop": library
+#       "/system/lib64/libaera_boot_trim.so" not found: needed by main executable
+#
+# /sbin is part of the rootfs and is never shadowed by a mount, so the shim
+# lives there instead. Keep this definition otherwise identical to the stock
+# file (the three `interface` lines are what let hwservicemanager lazy-start
+# this service for 1.0/1.1/1.2).
+service boot-hal-1-2 /system/bin/android.hardware.boot@1.2-service
+    interface android.hardware.boot@1.0::IBootControl default
+    interface android.hardware.boot@1.1::IBootControl default
+    interface android.hardware.boot@1.2::IBootControl default
+    user root
+    group root
+    setenv LD_LIBRARY_PATH /vendor/lib64:/vendor/lib:/system/lib64:/system/lib:/sbin
+    setenv LD_PRELOAD /sbin/libaera_boot_trim.so
+    disabled
+    seclabel u:r:recovery:s0

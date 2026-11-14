@@ -1,29 +1,32 @@
 # Handoff / current status
 
-Last updated: 2026-11-14 (run #4 flashed; both root causes proven on-device; VINTF fix unpushed)
+Last updated: 2026-11-14 (recovery boots, decrypts and browses files; fixes
+committed; one build left to make it all permanent)
 
 ## Read this first
 
-**The recovery UI works.** Run #4's image boots, and once the boot-HAL service
-was made to stay up, recovery reached the decryption PIN screen. Getting there
-needed **two** independent fixes, both now proven on the device:
+**The recovery works end to end.** It boots, shows the AERA lock screen,
+decrypts `/data` with the PIN, and browses files. Getting there needed **two**
+independent fixes, both proven on the device and both now committed:
 
 1. **ABI shim** — the A11 MTK boot-HAL prebuilt could not `dlopen` against A16
-   `libbase`. Fixed by `libaera_boot_trim` + `LD_PRELOAD` (**shipped in run #4**).
-2. **VINTF declaration** — with the shim, the HAL loaded and registered 1.0 but
+   `libbase`. Fixed by `libaera_boot_trim` (run #4).
+2. **VINTF declaration** — with the shim the HAL loaded and registered 1.0 but
    was refused on 1.2, so it exited. Declaring 1.0/1.1/1.2 in the vendor
-   manifest makes it stay up (**patched live, still unpushed**).
+   manifest keeps it up (proven by live patch; committed in `3a901f1`).
 
 - Run #4: id `43566176237`, commit `265c126`, branch `aera-16.0` — **success**
-- Flashed. `boot-hal-1-2` is now `running` (was crash-looping every 5 s), and
-  `recovery.log` (24 KB, up from 5.6 KB) ends at
-  `I:Is encrypted, do decrypt page first` — the PIN screen.
-- So build, boot header, MTK offsets, kernel, init, adbd, keymaster, the ramdisk
-  and the boot HAL are all **correct**.
+- Flashed and used: `init.svc.boot-hal-1-2` -> `running`, decryption PIN
+  accepted, `/data` mounted rw, file manager works, zip installs work.
+- So build, boot header, MTK offsets, kernel, init, adbd, keymaster, the ramdisk,
+  the boot HAL and decryption are all **correct**.
 
-**A fresh flash of run #4 regresses**: that image still carries the old manifest,
-so the HAL dies again. The fix lives in
-`recovery/root/vendor/etc/vintf/manifest.xml` locally and must be pushed.
+**Run #4's image is not the finished one.** It still carries the old manifest and
+the old *global* `LD_PRELOAD`. Both are fixed on the branch now; the next build
+is the first one that needs **no live patching** after flashing.
+
+**The one thing still broken at flash time is the scoped preload**, which is the
+whole point of the next build — see "The preload must be scoped" below.
 
 ## The actual bug (root-caused, not a guess)
 
@@ -76,7 +79,7 @@ unresolved count: 1
   `boot_a`/`boot_b`, `vbmeta_system_a/b`, `ro.boot.slot_suffix=_a`. The
   original PBRP tree sets both flags identically. **Do not change them.**
 
-### The fix (implemented locally, unpushed)
+### The fix (committed)
 
 A ~10 KB shim re-exporting the one missing symbol, `LD_PRELOAD`ed into the HAL:
 
@@ -85,25 +88,51 @@ A ~10 KB shim re-exporting the one missing symbol, `LD_PRELOAD`ed into the HAL:
 | `device/xiaomi/selene/bootctl_compat/trim_shim.cpp` | **new** — `android::base::Trim(const std::string&)` |
 | `device/xiaomi/selene/bootctl_compat/Android.bp` | **new** — `cc_library_shared` `libaera_boot_trim`, `stl: "libc++"`, `-fvisibility=default` |
 | `device/xiaomi/selene/device.mk` | `PRODUCT_PACKAGES += libaera_boot_trim` |
-| `device/xiaomi/selene/recovery/root/init.recovery.mt6768.rc` | `export LD_PRELOAD /system/lib64/libaera_boot_trim.so` in `on init` |
-| `.github/workflows/build-aera.yml` | builds the shim first, `readelf`-asserts the exact mangled symbol, copies it onto the recovery overlay, and fails the run if the staged recovery root lacks it |
+| `device/xiaomi/selene/recovery/root/system/etc/init/android.hardware.boot@1.2-service.rc` | **new** — override of the boot HAL service, adding `setenv LD_PRELOAD /sbin/libaera_boot_trim.so` |
+| `device/xiaomi/selene/recovery/root/init.recovery.mt6768.rc` | global `export LD_PRELOAD` **removed** (see below) |
+| `.github/workflows/build-aera.yml` | builds the shim first, `readelf`-asserts the exact mangled symbol, stages it at `recovery/root/sbin/`, and fails the run if the staged root lacks the shim, the `.rc` `setenv`, or the manifest `@1.2` fqname |
 
-Two mechanism choices worth keeping:
+### The preload must be scoped (the next build's reason to exist)
 
-- **`export`, not a service-scoped `setenv`.** The boot HAL's service
-  definition is a build-installed `.rc` we do not own, so overriding it would
-  race the installer. `export` is already used one line above for
-  `LD_LIBRARY_PATH`, and it provably reaches services: keymaster has a hard
-  `DT_NEEDED` on `libTEECommon.so` (which lives in `/vendor/lib64`), has **no
-  RUNPATH**, and loads fine — only the global `export LD_LIBRARY_PATH` can be
-  putting `/vendor/lib64` on its search path.
+Run #4 shipped `export LD_PRELOAD /system/lib64/libaera_boot_trim.so` in
+`on init`. That is **wrong in two independent ways**, both seen on the device:
+
+1. **Global scope breaks every dynamic binary once a zip mounts `/system`.**
+   A zip installer mounts the system partition over the ramdisk's `/system`, so
+   the preload path stops existing and even `getprop` dies:
+
+   ```
+   CANNOT LINK EXECUTABLE "getprop": library
+       "/system/lib64/libaera_boot_trim.so" not found: needed by main executable
+   ```
+
+   That is the gapps installer failing for our reason, not its own.
+
+2. **`/system` is the wrong home for it anyway.** The shim must live somewhere
+   a mount can never shadow. `/sbin` is a real rootfs directory (it already
+   holds `aerastart.sh`, `busybox`, `setgovernor`) and `/tmp` is tmpfs.
+
+So the preload is now **scoped to the one service that needs it**, via an
+override of `android.hardware.boot@1.2-service.rc`, and points at `/sbin`:
+
+```
+service boot-hal-1-2 /system/bin/android.hardware.boot@1.2-service
+    ...
+    setenv LD_PRELOAD /sbin/libaera_boot_trim.so
+```
+
+Overriding that `.rc` is safe: it is a plain build-installed file, and the
+recovery overlay (`recovery/root/`) is applied after it, so ours wins. The shim's
+own `DT_NEEDED` set is only `libc++/libc/libm/libdl`, which resolve from both the
+ramdisk and any mounted system, so `/sbin` placement always works.
+
+A missing `LD_PRELOAD` entry is non-fatal to the linker, so this cannot make the
+image less bootable: worst case the symbol stays missing and the HAL keeps
+crash-looping exactly as before.
+
 - **Overlay copy, not `TARGET_RECOVERY_DEVICE_MODULES`.** That variable does
   not exist in Android 16's build system. `recovery/root/` is the mechanism
   this tree already uses to get the MTK boot HAL into `/system/lib64/hw/`.
-
-A missing `LD_PRELOAD` entry is non-fatal to the linker, so this cannot make
-the image less bootable than it already is: worst case the symbol stays missing
-and the HAL keeps crash-looping exactly as before.
 
 ## The second bug: the VINTF manifest (proven by live patch)
 
@@ -168,27 +197,307 @@ manifest, and grepped the running device for refusals:
   keymaster are lazy HALs that start on demand. Do **not** add speculative
   declarations — the empirical list of refused fqnames is empty apart from boot.
 
+### Known cosmetic issue: health HAL retry
+
+`recovery` (pid 374) also asks for the health HAL once per second, forever:
+
+```
+I recovery: Unable to get AIDL health service, trying HIDL...
+servicemanager: Could not find android.hardware.health.IHealth/default in the
+    VINTF manifest
+W HidlServiceManagement: Waited one second for
+    android.hardware.health@2.0::IHealth/default
+```
+
+**This does not affect the battery indicator** — the UI reads
+`/sys/class/power_supply/battery` directly (verified on-device: `capacity 79`,
+`status Charging`, `voltage_now 4219000`, `current_now -252800`, `temp 316`).
+
+It is **not cheaply fixable** and was deliberately left alone. Recovery asks AIDL
+`android.hardware.health.IHealth` first, but the ramdisk only ships the HIDL
+`android.hardware.health@2.1-service` (which registers 2.1, not 2.0), and there
+is no AIDL health service or `.rc` anywhere in the tree. Starting the 2.1
+service by hand works (`Hal init done`, `Registered
+android.hardware.health@2.1::IHealth/default`, battery `l=80 v=4225 t=31.2`) but
+does not satisfy the client. Fixing it means shipping an AIDL health HAL or
+patching recovery's own client — out of scope for a cosmetic log line.
+
+## Known limitation: frame rate (~4 fps)
+
+The UI is usable but runs at roughly **4 fps** while animating. This is measured,
+not guessed, and it is a property of the AERA UI's software renderer on this
+SoC, not a driver, governor or thermal fault.
+
+Measured on the device:
+
+- `CLK_TCK=100`. The UI thread is **tid 399**. While animating it consumes
+  30-100 % of one core; the `recovery` main thread is parked in `futex_wait` and
+  consumes nothing. (An earlier reading of "44 % on the main thread" was the
+  wrong thread and led to the wrong conclusion.)
+- The engine's own instrumentation never prints its
+  `active animation submitted %.1f fps` line. `TrackSubmittedFrame()` resets its
+  window whenever a frame arrives **more than 250 ms** after the previous one,
+  so the absence of that line is itself proof that the frame interval exceeds
+  250 ms — i.e. under 4 fps.
+- All 8 cores sit at max clock and thermals are 31-33 °C, so it is not
+  throttling. There is no `/dev/dri`, so there is no DRM/GPU path at all:
+  `recovery.log` says `cannot find/open a drm device`.
+
+Why it is slow — the render path does far more work than the panel needs:
+
+1. `DisplayTransform::Adaptive()` hardcodes `logical_width = kDesignWidth`
+   (**1440**) and takes the height from `AERA_SCREEN_H`. Screen height is given
+   in 1080-wide reference units and is converted to 1440-wide space (x4/3), so
+   `AERA_SCREEN_H := 2400` yields a **1440x3200** canvas. That is **4.6 M
+   pixels** rendered every frame against a 1080x2400 panel of 2.6 M pixels —
+   ~78 % more pixels than are ever displayed.
+2. `IsScaled()` is therefore true, so every frame the finished 1440x3200 surface
+   is **bilinear-downscaled** to 1080x2400 by `res_scale_surface()`, which is
+   libpixelflinger (`GGL_LINEAR`) — a per-pixel software GL loop.
+3. Then `gr_blit()` copies 1080x2400 into the minui surface and `gr_flip()`
+   memcpys another 10.4 MB into the framebuffer and calls
+   `FBIOPUT_VSCREENINFO`.
+
+So each frame is a full-canvas software render plus a software rescale plus two
+full-frame copies. `LV_DISPLAY_RENDER_MODE_FULL` means the whole canvas is
+redrawn even for a one-widget change.
+
+**Not fixed, deliberately.** The only device-tree lever is
+`AERA_UI_ADAPTIVE_RESOLUTION := false`, which switches to native 1080x2400 and
+removes the rescale. It is **not safe**: the pages are authored in the 1440-wide
+coordinate space with hardcoded sizes, e.g. `decrypt_scene.cpp` does
+`lv_obj_set_size(state->keyboard, 1012, 1010)` and
+`lv_obj_set_size(key, 224, 224)`. At a 1080-wide canvas those overflow and clip.
+Only some scenes use a scaling helper (`lock_scene.cpp` uses `Px(s, 1100)`), so
+native mode would break the decrypt/pattern screens specifically — the ones you
+cannot get past without. Left as a documented limitation.
+
+**Why it cannot be tested without a build:** `adaptive_resolution` and
+`logical_height` arrive as a compile-time `DisplayMetrics` struct passed into
+`RunLoop()`; there is no property, file or CLI switch for either. `AERA_SCREEN_H`
+cannot be lowered to compensate either — the canvas must stay 1440x3200 to match
+the panel's 0.45 aspect, otherwise the X and Y scales diverge and the UI is
+squashed.
+
+Cheap things already ruled out, so nobody re-investigates them:
+
+- **Not the display panel.** `rdma0`/`ovl0`/`dsi0` IRQs are frozen when the UI
+  is idle (event-driven, no continuous scanout), and `idle_state` is `active`
+  while touching.
+- **Not `dock_blur=24` / wallpaper blur.** Blur is implemented in the GLSL
+  shader path (`u_IsBlur`), which is only used when `gpu_accelerated_` is true.
+  There is no GPU here, so blur never runs.
+- **Not `FBIOPUT_VSCREENINFO` latency alone.** Single-buffering would remove one
+  ioctl and one 10.4 MB copy, but the dominant cost is rendering 4.6 M pixels.
+
+## Storage: the "failing" MicroSD was simply not inserted
+
+A backup failed with `mkdir: '/sdcard1/AERA_write_test': I/O error` and
+
+```
+Buffer I/O error on dev mmcblk1p1, logical block 832, async page read
+```
+
+which looks exactly like dying media. It is not. Check the block layer before
+believing a storage error:
+
+```
+$ cat /proc/partitions        # only mmcblk0* — no mmcblk1 at all
+$ ls /sys/block/              # no mmcblk1
+$ ls /dev/block/ | grep mmc   # mmcblk0* only
+$ cat /sys/class/mmc_host/mmc1/device/name   # empty
+```
+
+`mmcblk1` was **absent from the block layer entirely** while `/sdcard1` was
+still mounted from `/dev/block/mmcblk1p1` via `exfat-fuse`. A mount whose block
+device has disappeared returns `EIO` for every access, forever. The card had
+been pulled (it was tested in another phone and worked there).
+
+**Lesson: `EIO` on a removable mount is a staleness symptom first and a
+media-failure symptom second.** Confirm the device still exists in
+`/proc/partitions` before concluding the card is bad. Reseat the card and remount
+`/sdcard1`; do not reformat anything on the strength of an `EIO` alone.
+
+Internal `/sdcard` (`/dev/block/dm-7`, f2fs) is unaffected and is a safe backup
+target meanwhile.
+
+## MTP cannot work on this kernel (use USB mass storage instead)
+
+`E:[MTP] could not open MTP driver, errno: 2` is not a recovery bug. The kernel
+was built without `CONFIG_USB_CONFIGFS_F_MTP`, so the function never exists:
+
+```
+$ ls /config/usb_gadget/g1/functions/
+ffs.adb  ffs.fastboot  mass_storage.usb0        # no mtp.gs0
+$ ls /dev/mtp_usb                               # No such file
+$ getprop sys.usb.config                        # mtp,adb  (set, but hollow)
+```
+
+`/init.recovery.usb.rc` does `mkdir /config/usb_gadget/g1/functions/mtp.gs0` and
+symlinks it to `configs/b.1/f1`; both fail silently because the kernel does not
+implement the function. `sys.usb.config=mtp,adb` and `sys.usb.ffs.mtp.ready=1`
+are therefore set with nothing behind them. This is a **kernel config** issue
+and cannot be fixed from the device tree.
+
+**Workaround: USB mass storage.** `mass_storage.usb0` *is* supported (the
+function directory exists and `TARGET_USE_CUSTOM_LUN_FILE_PATH` already points
+at `.../mass_storage.usb0/lun.%d/file`), so "Mount -> USB Storage" exposes
+`/sdcard` as an ordinary USB drive. Use that instead of MTP for pulling files.
+
+## Verified working on the device
+
+After run #4 (`43566176237`) plus the offline repack described below, all of the
+following was exercised on the phone, not inferred:
+
+| Feature | Evidence |
+| --- | --- |
+| Boot to the AERA UI | `boot_a` runs the patched image, with no live patching |
+| `/data` decryption | PIN screen accepted, `/sdcard` browsable |
+| Backup | `/sdcard1/AERA/BACKUPS/55ec505f0603/AERA-2026-11-14-12-56-14/boot.emmc.win` (64 MB) + `.sha2` + `recovery.log` |
+| Zip flash | `aera flash /sdcard/aera_flash_test.zip` -> `{"code":0}`; the zip's own marker printed `data_mounted=1`, `boot_hal=running`, `AERA FLASH TEST: success` |
+| MicroSD | `mmcblk1`, 58.3 GiB, exFAT via `exfat-fuse`, ~20 GB free |
+| Boot HAL | `init.svc.boot-hal-1-2=running`, `/sbin/libaera_boot_trim.so` present, shell `LD_PRELOAD` unset, logcat `Using HIDL version 1.2 of IBootControl` |
+
+### The offline boot-image repack (how the two fixes reached the phone without a build)
+
+Run #4's image had the boot-HAL shim but neither the scoped `LD_PRELOAD` nor the
+1.2 manifest entry, and there was no broadband to rebuild. Both fixes are pure
+ramdisk content, so the boot image was rebuilt locally instead of waiting:
+
+- `build_boot.py` unpacks the ramdisk (`cpio`), applies the `.rc` `setenv`, adds
+  the manifest `1.2::IBootControl` entry, drops the shim at `/sbin`, re-packs
+  (`cpio` + `gzip`), and rebuilds the Android boot header v2 (page 2048) plus
+  the AVB footer.
+- AVB does **not** need re-signing: `verifiedbootstate=orange`,
+  `veritymode=disabled` and `BOARD_AVB_MAKE_VBMETA_IMAGE_ARGS += --flags 3` mean
+  verification is skipped, so the original vbmeta blob is kept and only its
+  offset moves.
+- Result: `62,566,400` bytes with a `49,761,670` byte ramdisk. `boot_a` is
+  64 MB, so there is only ~1.5 MB of headroom. **The 39 MB Mali stack can never
+  be embedded in the boot image**; it has to come from the stock vendor
+  partition at runtime.
+- `boot_a.img` (pristine) is kept next to the patched image for
+  `fastboot flash boot boot_a.img`.
+
+### CLI: `aera backup --parts` needs TWRP-style mount points
+
+`aera backup --parts boot` fails with `backup_failed` and produces no log lines,
+because the backend validates the name against TWRP mount points. `aera backup
+--parts /boot` works. The GUI is unaffected (it passes `/boot`).
+
+## Mali GPU: the stock backend cannot initialize on selene (verified, not guessed)
+
+apkreader's `mali-testing` backend is merged and compiles, but it **cannot**
+accelerate selene. This is not a configuration mistake; the required HAL does
+not exist on the device. The evidence, from the stock
+`V14.0.7.0.TKUMIXM` dump (`Jiovanni-dump/redmi_selene_dump`, branch
+`missi_phoneext4_global-user-13-...`) and from the files themselves:
+
+| Path | Size | What it actually is |
+| --- | --- | --- |
+| `vendor/lib64/egl/libGLES_mali.so` | 39,386,416 | the real Mali driver; NEEDED includes `libnativewindow`, `libged`, `libgpu_aux`, `libgpud`, `libgralloc_extra`, `android.hardware.graphics.mapper@4.0`, `libgralloctypes`, `libhidlbase` |
+| `vendor/lib64/hw/hwcomposer.mt6768.so` | 1,032,864 | HWC2 composer, exports `HMI` |
+| `vendor/lib64/hw/gralloc.default.so` | 20,080 | **AOSP fbdev gralloc0**: exports `HMI`, `fb_device_open`, `mapFrameBufferLocked`, imports `ashmem_create_region` |
+| `vendor/lib64/hw/android.hardware.graphics.allocator@4.0-impl-mediatek.so` | 73,872 | HIDL allocator, exports `HIDL_FETCH_IAllocator` |
+| `vendor/lib64/hw/android.hardware.graphics.mapper@4.0-impl-mediatek.so` | 140,664 | HIDL mapper, exports `HIDL_FETCH_IMapper` |
+
+There is **no gralloc1 module anywhere on the device**. `gralloc.mt6768.so` was
+an Android 10/11 MediaTek artifact; the Android 13 vendor image replaced it with
+gralloc4/HIDL. `gralloc.default.so` is not a substitute: it is the generic fbdev
+gralloc0 module, so opening it through `gralloc1_open()` hands the backend a
+mismatched function table.
+
+The backend needs exactly this, from `aeraui/core/mali_display.cpp`:
+
+- `gralloc1_open(module, &allocator)` plus `GRALLOC1_FUNCTION_{CREATE_DESCRIPTOR,
+  DESTROY_DESCRIPTOR, SET_DIMENSIONS, SET_FORMAT, SET_PRODUCER_USAGE,
+  SET_CONSUMER_USAGE, ALLOCATE, GET_STRIDE, RELEASE}`, then `GET_STRIDE` on each
+  of 2-3 scanout buffers;
+- an HWC2 `hwc2_device_t` whose `common.version >> 24 == 2` (satisfied).
+
+### Why a gralloc1 shim was rejected
+
+Both vendor HIDL impls export their passthrough fetchers, so a shim looked
+possible. It is not worth it:
+
+- The shim would be compiled against AOSP 16 headers and link AOSP 16's
+  `libhidlbase`, while the vendor impls were built against Android 13's. Calling
+  `IAllocator::allocate` across an `sp<IAllocator>` boundary would put **two
+  copies of the HIDL runtime in one process**. That is the same ABI class of
+  failure as the `android::base::Trim` bug that broke the boot HAL, and it
+  cannot be validated without burning a two-hour build per attempt.
+- The driver's own dependency list proves the *vendor* side is a gralloc4 client
+  (`mapper@4.0` + `libgralloctypes`). Mixing a gralloc1 shim in front of it does
+  not reproduce what the vendor framework does.
+
+### What is shipped instead
+
+The backend is compiled in and stays dormant, which costs nothing at runtime and
+means a future gralloc1 module only needs a property change:
+
+- `ro.aera.gpu.*` point at the stock paths. `ro.aera.gpu.gralloc` deliberately
+  names the **absent** `gralloc.mt6768.so`, so `MaliDisplay::Load()` fails,
+  `MaliDisplay::Initialize()` reports a display-HAL failure, and
+  `GpuRenderer::Initialize()` returns false (`gpu_renderer.cpp:121-128`), after
+  which `engine.cpp:293-309` falls back to the software renderer. Do not point it
+  at `gralloc.default.so`.
+- `selene-gpu-launch.sh` is the best-effort `on boot` stager. It normally finds
+  nothing: selene uses dynamic partitions, so `vendor` lives inside `super` and
+  has no `/dev/block/by-name/vendor` node until AERA maps it in-process, which is
+  long after `on boot`. Log: `/tmp/aera-gpu-boot.log`.
+- `selene-gpu-libraries.sh` builds `/gpu/lib64` from the stock
+  system+vendor libraries (excluding `libc`/`libm`/`libdl`/`libdl_android`, which
+  the namespace links to the recovery process).
+- `selene-gpu-test.sh` is the **manual** probe. Run it after mounting `/vendor`:
+
+  ```
+  adb shell aera mount /vendor      # or Mount -> vendor in the UI
+  adb shell sh /system/bin/selene-gpu-test.sh
+  adb pull /tmp/aera-gpu-probe.txt
+  ```
+
+  It binds the mounted volumes under `/gpu`, stages `/gpu/lib64`, runs
+  `linker64 --list` on the four libraries, and greps the vendor `hw/` directory
+  for a gralloc1 provider. The `--list` output answers the only remaining open
+  question: whether the Android 13 vendor libraries resolve inside an Android 16
+  linker namespace. If they do not, the Mali path is finished on this vendor.
+- The namespace mechanism itself is fine: `android_create_namespace` and
+  `android_link_namespaces` are still exported by Android 16's
+  `libdl_android.so` (`bionic/libdl/libdl_android.cpp`).
+
+**Bottom line: do not expect `Mali HWC2 GPU ready` on selene.** The UI stays on
+the software renderer at ~4 fps. Revisit only if a gralloc1 module appears.
+
 ## What is pushed / what is pending
 
-Run #4 (`265c126`) shipped the shim half. These are **already on the branch**:
+**Everything is committed.** `265c126` shipped the shim, `3a901f1` shipped the
+VINTF manifest fix, and the scoped-preload commit ships the rest.
+
+On the branch:
 
 | File | Change |
 | --- | --- |
-| `.github/workflows/build-aera.yml` | `.repo` cache steps, `GOGC=40` / `GOMEMLIMIT=11GiB` / `GOMAXPROCS=2`, `-j16` sync, `cpio` + `xz-utils`, shim build + symbol assertion + recovery-root verification |
+| `.github/workflows/build-aera.yml` | `.repo` cache steps, `GOGC=40` / `GOMEMLIMIT=11GiB` / `GOMAXPROCS=2`, `-j16` sync, `cpio` + `xz-utils`, shim build + symbol assertion, `/sbin` staging, `.rc` `setenv` assertion, manifest `@1.2` assertion |
 | `device/xiaomi/selene/BoardConfig.mk` | `BUILD_BROKEN_MISSING_REQUIRED_MODULES := true` |
 | `device/xiaomi/selene/aera_selene.mk` | dropped `AERA_WORKAROUND_BACKUP_BUG` / `AERA_OPTIONS_LIST_NUM` |
 | `device/xiaomi/selene/device.mk` | `PRODUCT_PACKAGES += libaera_boot_trim` |
 | `device/xiaomi/selene/bootctl_compat/trim_shim.cpp` | the shim |
 | `device/xiaomi/selene/bootctl_compat/Android.bp` | shim module |
-| `device/xiaomi/selene/recovery/root/init.recovery.mt6768.rc` | `export LD_PRELOAD` for the shim |
-
-Still **pending** (this is the next push, which triggers run #5):
-
-| File | Change |
-| --- | --- |
-| `device/xiaomi/selene/recovery/root/vendor/etc/vintf/manifest.xml` | declare `android.hardware.boot` 1.1 + 1.2 and their fqnames |
-| `.github/workflows/build-aera.yml` | fail the run if the staged manifest lacks `@1.2::IBootControl/default` |
+| `device/xiaomi/selene/recovery/root/system/etc/init/android.hardware.boot@1.2-service.rc` | scoped `setenv LD_PRELOAD /sbin/libaera_boot_trim.so` |
+| `device/xiaomi/selene/recovery/root/init.recovery.mt6768.rc` | global `export LD_PRELOAD` removed; `on boot` GPU staging hook added |
+| `device/xiaomi/selene/recovery/root/vendor/etc/vintf/manifest.xml` | `android.hardware.boot` 1.0 + 1.1 + 1.2 and their fqnames |
+| `device/xiaomi/selene/recovery/root/system/bin/selene-gpu-launch.sh` | best-effort `on boot` stager, logs to `/tmp/aera-gpu-boot.log` |
+| `device/xiaomi/selene/recovery/root/system/bin/selene-gpu-libraries.sh` | builds the `/gpu/lib64` namespace library directory |
+| `device/xiaomi/selene/recovery/root/system/bin/selene-gpu-test.sh` | manual `linker64 --list` dependency probe |
+| `device/xiaomi/selene/device.mk` | `ro.aera.gpu.*` properties |
 | `HANDOFF.md` | this file |
+
+The workflow also switches `bootable/recovery` to apkreader's `mali-testing`
+branch, applies the four LVGL patches, and asserts that `mali_display.cpp`
+exists, that `aeraui/Android.bp` lists it, and that all three GPU scripts are
+staged executable in the recovery root.
+
+Pending: **nothing but the build itself.**
 
 ## Run history
 
@@ -198,23 +507,26 @@ Still **pending** (this is the next push, which triggers run #5):
 | #2 `43501925957` | failure, 4 min | deps | `libncurses5` / `lib32ncurses5-dev` do not exist on Ubuntu 24.04; one bad name aborts the whole apt transaction |
 | #3 `43503314394` | **success** | boots to recovery, UI blocked | boot-HAL prebuilt ABI break (one symbol) |
 | #4 `43566176237` | **success** | decryption PIN screen (after live manifest patch) | shim fixed `dlopen`; VINTF refusal on boot@1.2 remained — manifest fix unpushed |
+| #5 `43586256262` | cancelled | — | superseded before the manifest-only image was built; the scoped-preload fix went in instead |
 
 ## Next time you sit down
 
-1. Push the pending change set above (it triggers run #5).
-2. In run #5's log, the `Build` step should print `shim built: ...`,
-   `boot-HAL shim staged at: ...`, a `readelf` line with
-   `_ZN7android4base4Trim...`, and `manifest declares boot@1.2: ...`. Any
-   missing line fails the run on purpose — read the `::error::` line.
-3. Flash and confirm **without any live patching**:
+1. Trigger **one** build from `aera-16.0`. The `Build` step must print
+   `shim built: ...`, `boot-HAL shim staged at: ...`, a `readelf` line with
+   `_ZN7android4base4Trim...`, `boot HAL preload staged: ...` and
+   `manifest declares boot@1.2: ...`. A missing line fails the run on purpose —
+   read the `::error::` line.
+2. Flash and confirm **without any live patching**:
    - `getprop init.svc.boot-hal-1-2` -> `running`
    - `logcat -d | grep -E "Registered android.hardware.boot@1.2|Using HIDL version 1.2"`
    - `recovery.log` ends at `I:Is encrypted, do decrypt page first`
-   - the PIN screen appears.
-4. Anything after that (actual decryption, WLAN, browser sandbox) is ordinary
-   debugging — see "Open risk: decryption".
-
-If a failure traces to keymaster / relink / FBE, see "Open risk: decryption".
+   - the PIN screen appears and `/data` decrypts.
+3. Confirm the preload regression is gone: flash any zip and check that the
+   installer's `getprop`/`sh` do **not** die with
+   `CANNOT LINK EXECUTABLE ... libaera_boot_trim.so not found`.
+4. If a backup fails with `EIO`, check `/proc/partitions` for `mmcblk1` before
+   blaming the card — a removed card leaves a stale mount that EIOs forever
+   (see "Storage" below). Internal `/sdcard` is a safe target meanwhile.
 
 
 ### How to push (no git/gh installed locally)
@@ -304,6 +616,14 @@ Restore source cache -> Sync AERA sources -> Save source cache
   only the global `export LD_LIBRARY_PATH` in `init.recovery.mt6768.rc` can be
   putting that directory on its search path. Use `export` when the target
   service's `.rc` is build-installed and you cannot own it.
+- **UI CPU is software rendering, and it is the frame-rate limit.** Measured on
+  the device with `CLK_TCK=100`: the UI thread is **tid 399** (not the `recovery`
+  main thread, which sits in `futex_wait`), it runs at 30-100 % of one core while
+  animating, all 8 cores ramp to max (1.8 GHz little / 2.0 GHz big) and thermals
+  stay at 31-33 °C. So it is **not** a governor or thermal problem, and do not
+  "fix" it by pinning the governor. An earlier note in this file claimed ~44 % on
+  the main thread and concluded "not render cost" — that sampled the wrong
+  thread. See "Known limitation: frame rate" for the real numbers.
 - **`hwservicemanager` enforces the VINTF manifest on `registerAsService()`.**
   A HIDL service whose fqname is not declared is refused with
   `must be in VINTF manifest in order to register/get`, and the process then

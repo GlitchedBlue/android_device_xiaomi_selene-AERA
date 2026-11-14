@@ -3,20 +3,24 @@ import /init.microtrust.rc
 on init
     export LD_LIBRARY_PATH /system/lib64:/vendor/lib64:/vendor/lib64/hw:/system/lib64/hw
 
-    # The stock MediaTek boot-control HAL is an Android 11 prebuilt that imports
-    # android::base::Trim(std::string const&). Android 13 replaced that overload
-    # with a std::string_view one, so dlopen() fails with
-    #   cannot locate symbol "_ZN7android4base4TrimERKNSt3__112basic_string..."
-    # boot-hal-1-2 then exits with status 1 in a loop and recovery blocks
-    # forever waiting for android.hardware.boot@1.0::IBootControl/default,
-    # which is why the UI never draws.
-    #
-    # libaera_boot_trim re-exports just that symbol. `export` (not a
-    # service-scoped `setenv`) is required because the HAL service definition
-    # lives in a build-installed .rc we do not own. Missing LD_PRELOAD entries
-    # are non-fatal to the linker, so this cannot break anything that
-    # currently works.
-    export LD_PRELOAD /system/lib64/libaera_boot_trim.so
+    # The boot-control HAL's libaera_boot_trim LD_PRELOAD is scoped to the
+    # service in recovery/root/system/etc/init/android.hardware.boot@1.2-service.rc,
+    # NOT exported globally. A global preload of a /system path breaks every
+    # dynamically linked binary (getprop, sh, zip installers) as soon as a zip
+    # mounts the system partition over the ramdisk's /system. See that .rc for
+    # the ABI background and the /sbin placement.
+
+# Best-effort staging of the stock Android 13 Mali/HWC2 stack before init starts
+# the recovery service. This rc is imported before init.rc's own `on boot`, so
+# the boot actions run in parse order: this one first, then class_start default.
+# The script only mounts/stages; it must not exec recovery itself.
+#
+# On selene this usually finds nothing: `vendor` is a logical partition inside
+# `super` and is not mapped this early, so the script logs and exits and AERA
+# keeps the software renderer. Run /system/bin/selene-gpu-test.sh by hand after
+# mounting /vendor for the real dependency probe.
+on boot
+    exec u:r:recovery:s0 root root -- /system/bin/sh /system/bin/selene-gpu-launch.sh
 
 on post-fs
     # Support A/B feature for EMMC and UFS boot region

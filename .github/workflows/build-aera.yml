@@ -206,6 +206,28 @@ jobs:
           path: aera/.repo
           key: aera-sync-${{ env.MANIFEST_BRANCH }}-v1
 
+      # ---------------------------------------------------------------------
+      # Mali GPU backend
+      # ---------------------------------------------------------------------
+      # apkreader's mali-testing branch adds the stock-driver Mali backend on
+      # top of exactly the recovery commit this manifest pins (e438f6d) and the
+      # LVGL base (6267941). Switch the checkout and apply the four LVGL
+      # patches; --check verifies the sequence before touching anything.
+      - name: Apply Mali GPU backend
+        run: |
+          cd "${WORKDIR}"
+          git -C bootable/recovery fetch --depth=1 \
+            https://github.com/apkreader/android_bootable_recovery.git mali-testing
+          git -C bootable/recovery switch --detach FETCH_HEAD
+          test -f bootable/recovery/aeraui/core/mali_display.cpp \
+            || { echo "::error::mali_display.cpp is missing after the branch switch"; exit 1; }
+          grep -q 'core/mali_display.cpp' bootable/recovery/aeraui/Android.bp \
+            || { echo "::error::aeraui/Android.bp does not list mali_display.cpp"; exit 1; }
+          python3 bootable/recovery/aeraui/tools/prepare-mali-lvgl.py --check
+          python3 bootable/recovery/aeraui/tools/prepare-mali-lvgl.py
+          echo "mali backend: $(git -C bootable/recovery rev-parse --short HEAD)"
+          echo "lvgl:         $(git -C external/lvgl rev-parse --short HEAD)"
+
       - name: Add the device tree
         run: |
           cd "${WORKDIR}"
@@ -264,9 +286,11 @@ jobs:
 
           # Build the boot-HAL ABI shim before the full build. It takes seconds
           # and lets a wrong symbol name fail here instead of 90 minutes later.
-          # The shim is then placed on the recovery overlay path, which is the
-          # mechanism this tree already uses to get the MTK boot HAL prebuilt
-          # into /system/lib64/hw/ of the ramdisk.
+          # The shim is staged on the recovery overlay at /sbin: that is rootfs
+          # and therefore survives a zip installer mounting the system partition
+          # over /system. (A /system path made getprop unexecutable mid-install:
+          #   CANNOT LINK EXECUTABLE "getprop": library
+          #     "/system/lib64/libaera_boot_trim.so" not found)
           m libaera_boot_trim
 
           SHIM=$(find "out/target/product/${DEVICE}" -name libaera_boot_trim.so -print -quit)
@@ -285,9 +309,9 @@ jobs:
             readelf -sW "${SHIM}" | grep -i trim || true
             exit 1
           fi
-          mkdir -p "${DEVICE_PATH}/recovery/root/system/lib64"
-          cp -f "${SHIM}" "${DEVICE_PATH}/recovery/root/system/lib64/"
-          ls -l "${DEVICE_PATH}/recovery/root/system/lib64/libaera_boot_trim.so"
+          mkdir -p "${DEVICE_PATH}/recovery/root/sbin"
+          cp -f "${SHIM}" "${DEVICE_PATH}/recovery/root/sbin/"
+          ls -l "${DEVICE_PATH}/recovery/root/sbin/libaera_boot_trim.so"
 
           set +e
           mka adbd "${BUILD_TARGET}"
@@ -309,7 +333,7 @@ jobs:
           # exactly what gets packed into the ramdisk.
           if [ "$rc" -eq 0 ]; then
             SHIM_IN_ROOT=$(find "out/target/product/${DEVICE}" \
-              -path '*recovery/root/system/lib64/libaera_boot_trim.so' -print -quit 2>/dev/null)
+              -path '*recovery/root/sbin/libaera_boot_trim.so' -print -quit 2>/dev/null)
             if [ -z "${SHIM_IN_ROOT}" ]; then
               echo "::error::libaera_boot_trim.so is missing from the staged recovery root; the ramdisk would ship without the boot-HAL shim"
               find "out/target/product/${DEVICE}" -maxdepth 2 -type d 2>/dev/null | head -40 || true
@@ -317,6 +341,21 @@ jobs:
             else
               echo "boot-HAL shim staged at: ${SHIM_IN_ROOT}"
               readelf -sW "${SHIM_IN_ROOT}" | grep -i trim || true
+            fi
+
+            # The preload must be scoped to the boot HAL and point at /sbin.
+            # A global export, or a /system path, breaks zip installers.
+            BOOTRC_IN_ROOT=$(find "out/target/product/${DEVICE}" \
+              -path '*recovery/root/system/etc/init/android.hardware.boot@1.2-service.rc' -print -quit 2>/dev/null)
+            if [ -z "${BOOTRC_IN_ROOT}" ]; then
+              echo "::error::boot HAL .rc override is missing from the staged recovery root; the shim would never be preloaded"
+              rc=1
+            elif ! grep -q 'setenv LD_PRELOAD /sbin/libaera_boot_trim.so' "${BOOTRC_IN_ROOT}"; then
+              echo "::error::boot HAL .rc does not setenv LD_PRELOAD /sbin/libaera_boot_trim.so"
+              grep -n -A10 'service boot-hal-1-2' "${BOOTRC_IN_ROOT}" || true
+              rc=1
+            else
+              echo "boot HAL preload staged: ${BOOTRC_IN_ROOT}"
             fi
 
             # Same reasoning for the VINTF manifest. The MTK boot HAL registers
@@ -336,6 +375,23 @@ jobs:
               echo "manifest declares boot@1.2: ${MANIFEST_IN_ROOT}"
               grep -n 'IBootControl/default' "${MANIFEST_IN_ROOT}" || true
             fi
+
+            # The Mali staging/probe scripts live in the recovery overlay and
+            # must reach the ramdisk executable. A silently missing or
+            # non-executable script means the GPU path can never be tested.
+            for script in selene-gpu-launch.sh selene-gpu-test.sh selene-gpu-libraries.sh; do
+              STAGED=$(find "out/target/product/${DEVICE}" \
+                -path "*recovery/root/system/bin/${script}" -print -quit 2>/dev/null)
+              if [ -z "${STAGED}" ]; then
+                echo "::error::${script} is missing from the staged recovery root"
+                rc=1
+              elif [ ! -x "${STAGED}" ]; then
+                echo "::error::${script} is not executable in the staged recovery root"
+                rc=1
+              else
+                echo "gpu script staged: ${STAGED}"
+              fi
+            done
           fi
 
           df -h .

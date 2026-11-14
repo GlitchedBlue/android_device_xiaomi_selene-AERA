@@ -23,7 +23,9 @@
  * against the device's own library set), so re-exporting it is enough to make
  * the prebuilt load unchanged.
  *
- * The library is LD_PRELOADed into boot-hal-1-2 from init.recovery.mt6768.rc.
+ * The library is LD_PRELOADed into boot-hal-1-2 by its .rc override (see
+ * recovery/root/system/etc/init/android.hardware.boot@1.2-service.rc) and is
+ * staged in /sbin so a zip mounting over /system cannot hide it.
  * A missing LD_PRELOAD entry is not fatal to the linker, so this cannot make
  * the image less bootable than it already is: worst case the symbol stays
  * missing and the HAL keeps crash-looping exactly as before.
