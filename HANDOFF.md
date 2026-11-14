@@ -1,20 +1,29 @@
 # Handoff / current status
 
-Last updated: 2026-11-14 (run #3 flashed; boot-HAL ABI fix implemented, not yet pushed)
+Last updated: 2026-11-14 (run #4 flashed; both root causes proven on-device; VINTF fix unpushed)
 
 ## Read this first
 
-**The image builds and boots. It hangs on the boot logo because of one missing
-symbol in a vendor prebuilt, and the fix for that is written and unpushed.**
+**The recovery UI works.** Run #4's image boots, and once the boot-HAL service
+was made to stay up, recovery reached the decryption PIN screen. Getting there
+needed **two** independent fixes, both now proven on the device:
 
-- Run #3: id `43503314394`, commit `b021eef`, branch `aera-16.0` — **success**
-- Image flashed by the user. Phone reaches AERA recovery: `adb` is live,
-  `product:aera_selene`, kernel healthy, no crash.
-- `recovery` (pid 367), `keymaster@4.1-service.beanpod`, `adbd` and `ueventd`
-  are all running, uptime 13+ min, `aera_selene-eng 99.87.36 BP2A.250605.031.A2`,
-  SDK 36, fbdev graphics init OK (`framebuffer: 5 (1080 x 2400)`).
-- So: build, boot header, MTK offsets, kernel, init, adbd, keymaster and the
-  ramdisk are all **correct**. The failure is one HIDL service.
+1. **ABI shim** — the A11 MTK boot-HAL prebuilt could not `dlopen` against A16
+   `libbase`. Fixed by `libaera_boot_trim` + `LD_PRELOAD` (**shipped in run #4**).
+2. **VINTF declaration** — with the shim, the HAL loaded and registered 1.0 but
+   was refused on 1.2, so it exited. Declaring 1.0/1.1/1.2 in the vendor
+   manifest makes it stay up (**patched live, still unpushed**).
+
+- Run #4: id `43566176237`, commit `265c126`, branch `aera-16.0` — **success**
+- Flashed. `boot-hal-1-2` is now `running` (was crash-looping every 5 s), and
+  `recovery.log` (24 KB, up from 5.6 KB) ends at
+  `I:Is encrypted, do decrypt page first` — the PIN screen.
+- So build, boot header, MTK offsets, kernel, init, adbd, keymaster, the ramdisk
+  and the boot HAL are all **correct**.
+
+**A fresh flash of run #4 regresses**: that image still carries the old manifest,
+so the HAL dies again. The fix lives in
+`recovery/root/vendor/etc/vintf/manifest.xml` locally and must be pushed.
 
 ## The actual bug (root-caused, not a guess)
 
@@ -96,9 +105,72 @@ A missing `LD_PRELOAD` entry is non-fatal to the linker, so this cannot make
 the image less bootable than it already is: worst case the symbol stays missing
 and the HAL keeps crash-looping exactly as before.
 
-## DO NOT PUSH
+## The second bug: the VINTF manifest (proven by live patch)
 
-Eight files are modified locally and deliberately **unpushed**:
+With the shim in place the `dlopen` error disappeared and the service exit code
+changed from 1 to 0 — but it still did not stay up:
+
+```
+E HidlServiceManagement: Service android.hardware.boot@1.2::IBootControl/default
+    must be in VINTF manifest in order to register/get.
+E LegacySupport: Could not register service
+    android.hardware.boot@1.0::IBootControl/default (-2147483648).
+```
+
+`hwservicemanager` refuses any `registerAsService()` whose fqname is not in the
+device manifest. Our `recovery/root/vendor/etc/vintf/manifest.xml` declared only:
+
+```xml
+<name>android.hardware.boot</name>
+<version>1.0</version>
+...
+<fqname>@1.0::IBootControl/default</fqname>
+```
+
+The MTK implementation registers **both** 1.0 and 1.2. The 1.2 registration is
+rejected, the process exits, and recovery keeps retrying 1.0 against a service
+that never survives. Fix — add 1.1 and 1.2:
+
+```xml
+<version>1.0</version>
+<version>1.1</version>
+<version>1.2</version>
+...
+<fqname>@1.0::IBootControl/default</fqname>
+<fqname>@1.1::IBootControl/default</fqname>
+<fqname>@1.2::IBootControl/default</fqname>
+```
+
+**Validated live, not just theorised.** `/` is a writable `rootfs` in recovery,
+so the manifest was pushed to `/vendor/etc/vintf/manifest.xml` and
+`hwservicemanager` restarted (it is not `critical`; `adbd` survives). After the
+restart:
+
+```
+I HidlServiceManagement: Registered android.hardware.boot@1.2::IBootControl/default
+I LegacySupport: Registration complete for android.hardware.boot@1.0::IBootControl/default.
+I recovery: Using HIDL version 1.2 of IBootControl
+I:Is encrypted, do decrypt page first
+```
+
+`init.svc.boot-hal-1-2` -> `running`. **Both fixes are required**: the shim alone
+gets the lib loaded, the manifest alone would still fail `dlopen`.
+
+### Manifest audit: no third bug of this class
+
+Checked every `interface` declared in the ramdisk's `.rc` files against the
+manifest, and grepped the running device for refusals:
+
+- Only `android.hardware.boot@1.2` was ever refused. Nothing else.
+- `gatekeeper@1.0` (manifest line 100) and `keymaster@4.1` (line 150) are
+  declared. `health` and `fastboot` are absent, but nothing is refused for them:
+  `fastbootd` is `stopped` (normal outside fastbootd mode) and gatekeeper /
+  keymaster are lazy HALs that start on demand. Do **not** add speculative
+  declarations — the empirical list of refused fqnames is empty apart from boot.
+
+## What is pushed / what is pending
+
+Run #4 (`265c126`) shipped the shim half. These are **already on the branch**:
 
 | File | Change |
 | --- | --- |
@@ -106,14 +178,17 @@ Eight files are modified locally and deliberately **unpushed**:
 | `device/xiaomi/selene/BoardConfig.mk` | `BUILD_BROKEN_MISSING_REQUIRED_MODULES := true` |
 | `device/xiaomi/selene/aera_selene.mk` | dropped `AERA_WORKAROUND_BACKUP_BUG` / `AERA_OPTIONS_LIST_NUM` |
 | `device/xiaomi/selene/device.mk` | `PRODUCT_PACKAGES += libaera_boot_trim` |
-| `device/xiaomi/selene/bootctl_compat/trim_shim.cpp` | new — the shim |
-| `device/xiaomi/selene/bootctl_compat/Android.bp` | new — shim module |
+| `device/xiaomi/selene/bootctl_compat/trim_shim.cpp` | the shim |
+| `device/xiaomi/selene/bootctl_compat/Android.bp` | shim module |
 | `device/xiaomi/selene/recovery/root/init.recovery.mt6768.rc` | `export LD_PRELOAD` for the shim |
-| `HANDOFF.md` | this file |
 
-Pushing any `device/**` or workflow change **triggers a build**, which is
-exactly what we want next — but only after the user says go, so a stray push
-cannot race a run the user is waiting on.
+Still **pending** (this is the next push, which triggers run #5):
+
+| File | Change |
+| --- | --- |
+| `device/xiaomi/selene/recovery/root/vendor/etc/vintf/manifest.xml` | declare `android.hardware.boot` 1.1 + 1.2 and their fqnames |
+| `.github/workflows/build-aera.yml` | fail the run if the staged manifest lacks `@1.2::IBootControl/default` |
+| `HANDOFF.md` | this file |
 
 ## Run history
 
@@ -121,24 +196,22 @@ cannot race a run the user is waiting on.
 | --- | --- | --- | --- |
 | #1 `43495414023` | failure, 25 min | `lunch` | `PRODUCT_USE_DYNAMIC_PARTITIONS` in `BoardConfig.mk` -> `cannot assign to readonly variable` |
 | #2 `43501925957` | failure, 4 min | deps | `libncurses5` / `lib32ncurses5-dev` do not exist on Ubuntu 24.04; one bad name aborts the whole apt transaction |
-| #3 `43503314394` | **success** | boots to recovery, UI blocked | boot-HAL prebuilt ABI break (one symbol) — fix written, see above |
+| #3 `43503314394` | **success** | boots to recovery, UI blocked | boot-HAL prebuilt ABI break (one symbol) |
+| #4 `43566176237` | **success** | decryption PIN screen (after live manifest patch) | shim fixed `dlopen`; VINTF refusal on boot@1.2 remained — manifest fix unpushed |
 
 ## Next time you sit down
 
-1. Push the change set above (it triggers run #4).
-2. In run #4's log, the `Build` step should print
-   `shim built: ...`, `boot-HAL shim staged at: ...` and a `readelf` line
-   containing `_ZN7android4base4Trim...`. If any of those is missing the run
-   fails early on purpose — read the `::error::` line, not the tail.
-3. Flash the image and watch `adb logcat`:
-   - **Fixed** if `Failed to dlopen ... Trim` is gone and
-     `boot-hal-1-2` stays up (`getprop init.svc.boot-hal-1-2` -> `running`).
-     The UI should then draw.
-   - **Still broken** if the dlopen error persists: the `LD_PRELOAD` did not
-     reach the process, or the lib landed somewhere other than
-     `/system/lib64`. Check `adb shell ls -l /system/lib64/libaera_boot_trim.so`
-     and `adb shell cat /proc/<boot-hal pid>/environ`.
-4. Anything after that (decryption, WLAN, browser sandbox) is ordinary
+1. Push the pending change set above (it triggers run #5).
+2. In run #5's log, the `Build` step should print `shim built: ...`,
+   `boot-HAL shim staged at: ...`, a `readelf` line with
+   `_ZN7android4base4Trim...`, and `manifest declares boot@1.2: ...`. Any
+   missing line fails the run on purpose — read the `::error::` line.
+3. Flash and confirm **without any live patching**:
+   - `getprop init.svc.boot-hal-1-2` -> `running`
+   - `logcat -d | grep -E "Registered android.hardware.boot@1.2|Using HIDL version 1.2"`
+   - `recovery.log` ends at `I:Is encrypted, do decrypt page first`
+   - the PIN screen appears.
+4. Anything after that (actual decryption, WLAN, browser sandbox) is ordinary
    debugging — see "Open risk: decryption".
 
 If a failure traces to keymaster / relink / FBE, see "Open risk: decryption".
@@ -148,8 +221,8 @@ If a failure traces to keymaster / relink / FBE, see "Open risk: decryption".
 
 All pushes go through the GitHub REST Git Data API from PowerShell using the PAT
 in `.gh_token`: create blobs (base64) -> create tree with `base_tree` = current
-HEAD tree -> create commit -> `PATCH /git/refs/heads/aera-16.0`. Only the 4 files
-above need to go in the tree.
+HEAD tree -> create commit -> `PATCH /git/refs/heads/aera-16.0`. Only the files
+listed under "Still pending" need to go in the tree.
 
 Gotcha that cost time: build the tree URL by string concatenation, not
 `"$api/git/trees/$head?recursive=1"` — PowerShell mangles the `?` and GitHub
@@ -231,6 +304,13 @@ Restore source cache -> Sync AERA sources -> Save source cache
   only the global `export LD_LIBRARY_PATH` in `init.recovery.mt6768.rc` can be
   putting that directory on its search path. Use `export` when the target
   service's `.rc` is build-installed and you cannot own it.
+- **`hwservicemanager` enforces the VINTF manifest on `registerAsService()`.**
+  A HIDL service whose fqname is not declared is refused with
+  `must be in VINTF manifest in order to register/get`, and the process then
+  exits — often with status **0**, which looks like success in `logcat`. The
+  manifest is parsed at `hwservicemanager` startup, so a live edit only takes
+  effect after `setprop ctl.restart hwservicemanager` (it is not `critical`).
+  Declare every version the implementation registers, not just the oldest.
 
 ## Source caching: measured, not guessed
 

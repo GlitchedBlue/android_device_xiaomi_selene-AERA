@@ -318,6 +318,24 @@ jobs:
               echo "boot-HAL shim staged at: ${SHIM_IN_ROOT}"
               readelf -sW "${SHIM_IN_ROOT}" | grep -i trim || true
             fi
+
+            # Same reasoning for the VINTF manifest. The MTK boot HAL registers
+            # both 1.0 and 1.2, and hwservicemanager refuses any fqname the
+            # device manifest does not declare. Without @1.2 the HAL is rejected,
+            # exits, and recovery blocks forever in IBootControl::getService().
+            MANIFEST_IN_ROOT=$(find "out/target/product/${DEVICE}" \
+              -path '*recovery/root/vendor/etc/vintf/manifest.xml' -print -quit 2>/dev/null)
+            if [ -z "${MANIFEST_IN_ROOT}" ]; then
+              echo "::error::vendor VINTF manifest is missing from the staged recovery root"
+              rc=1
+            elif ! grep -q '@1.2::IBootControl/default' "${MANIFEST_IN_ROOT}"; then
+              echo "::error::staged vendor manifest does not declare @1.2::IBootControl/default; the boot HAL would be refused and recovery would block"
+              grep -n -A8 'android.hardware.boot' "${MANIFEST_IN_ROOT}" || true
+              rc=1
+            else
+              echo "manifest declares boot@1.2: ${MANIFEST_IN_ROOT}"
+              grep -n 'IBootControl/default' "${MANIFEST_IN_ROOT}" || true
+            fi
           fi
 
           df -h .
