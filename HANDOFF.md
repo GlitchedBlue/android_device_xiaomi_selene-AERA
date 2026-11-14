@@ -424,6 +424,20 @@ returns exactly two gralloc files, and both are the same thing:
 /vendor/lib/hw/gralloc.default.so       11,772   AOSP fbdev gralloc0
 ```
 
+This was re-checked against the **stock firmware dump**
+(`Jiovanni-dump/redmi_selene_dump`, branch
+`missi_phoneext4_global-user-13-TP1A.220624.014-V14.0.7.0.TKUMIXM-release-keys`),
+because the phone runs a heavily modified vendor and a modified vendor could in
+principle have dropped a module that stock ships. It did not: the dump's
+10,783-entry tree contains no `gralloc1` provider either, and its
+`vendor/lib64/hw/gralloc.default.so` (20,080 B) is the same fbdev gralloc0 —
+`fb_device_open`, `mapFrameBufferLocked`, `gralloc_register_buffer`,
+`terminateBuffer`, and not one `gralloc1` string. The dump's branch name also
+confirms the vendor is Android 13 (`user-13-TP1A.220624.014`); the `:12/` in
+`ro.vendor.build.fingerprint` is a Xiaomi labelling quirk, not the API level.
+
+So the absence is a property of **the platform**, not of the modification.
+
 - `/system/lib64/hw/` and `/system/lib/hw/` contain **no gralloc at all** — only
   the audio impls (`audio@2.0` … `audio@7.1`, `audio.sysbta.default.so`). All
   graphics HALs live on `/vendor/lib64/hw`. Do not go looking on `/system`.
