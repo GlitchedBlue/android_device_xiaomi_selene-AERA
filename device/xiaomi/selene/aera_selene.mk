@@ -18,10 +18,14 @@
 # "0" really does keep WLAN off.
 AERA_ENABLE_WLAN := 0
 
-# Items per page in the native options list.
-AERA_OPTIONS_LIST_NUM := 6
-
-# Work around the known backup failure on this device class.
-# The backend already defaults this to 1 when unset, so this is explicit
-# rather than load-bearing.
-AERA_WORKAROUND_BACKUP_BUG := 1
+# Deliberately not set (confirmed by AzzyC, the AERA peridot maintainer):
+#
+#   AERA_WORKAROUND_BACKUP_BUG
+#       The workaround was merged into OrangeFox and no longer needs a flag.
+#       aera_build.mk still carries the remnant -- it defaults
+#       OF_WORKAROUND_BACKUP_BUG to 1 when unset -- so setting it changed
+#       nothing either way.
+#
+#   AERA_OPTIONS_LIST_NUM
+#       Still mapped (aera_config.mk:46 -> aera_build.mk:724) but the AERA UI
+#       does not rely on it. Left at the built-in default.

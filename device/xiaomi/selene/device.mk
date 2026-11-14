@@ -47,4 +47,17 @@ PRODUCT_TARGET_VNDK_VERSION := 31
 PRODUCT_SOONG_NAMESPACES += \
     $(DEVICE_PATH)
 
+# ---------------------------------------------------------------------------
+# Boot-control HAL ABI shim
+# ---------------------------------------------------------------------------
+# recovery/root ships the Android 11 MediaTek boot HAL prebuilt, which imports
+# android::base::Trim(std::string const&). Android 13 replaced that overload
+# with a std::string_view one, so the prebuilt cannot be dlopen()ed on Android
+# 16 and boot-hal-1-2 crash-loops while recovery waits forever in
+# IBootControl::getService().
+#
+# libaera_boot_trim re-exports the missing symbol; init.recovery.mt6768.rc
+# LD_PRELOADs it into the HAL. See bootctl_compat/trim_shim.cpp.
+PRODUCT_PACKAGES += libaera_boot_trim
+
 $(call inherit-product, $(DEVICE_PATH)/aera_selene.mk)

@@ -103,7 +103,8 @@ jobs:
                   libc6-dev-i386 libncurses-dev lib32ncurses-dev libncurses5 \
                   lib32ncurses5-dev x11proto-core-dev libx11-dev lib32z1-dev \
                   libgl1-mesa-dev libxml2-utils xsltproc unzip fontconfig \
-                  python3 python-is-python3 rsync lz4 bc ccache imagemagick libssl-dev"
+                  python3 python-is-python3 rsync lz4 bc ccache imagemagick libssl-dev \
+                  cpio xz-utils"
           AVAILABLE=""
           for pkg in $WANTED; do
             if apt-cache show "$pkg" >/dev/null 2>&1; then
@@ -134,6 +135,22 @@ jobs:
       # .repo. Hence: fail fast on prompts, a 45 minute cap per attempt, a
       # heartbeat so the runner never goes silent for an hour, and a free
       # space guard that fails loudly instead of burning half an hour.
+      #
+      # The .repo cache is worth ~12 minutes per attempt. Measured on
+      # ILYESwsa's F11 workflow (same manifest, same runner class):
+      #   restore 18.8 GB cache   3m39s
+      #   repo sync after restore  3m46s
+      #   total                     ~7m30s   (vs ~20m cold)
+      # It is an 18.8 GB entry, well over the 10 GB free-tier figure -- it
+      # restores fine in practice, so do not "fix" it by trimming the path.
+      - name: Restore source cache
+        id: synccache
+        uses: actions/cache/restore@v4
+        continue-on-error: true
+        with:
+          path: aera/.repo
+          key: aera-sync-${{ env.MANIFEST_BRANCH }}-v1
+
       - name: Sync AERA sources
         run: |
           mkdir -p "${WORKDIR}"
@@ -158,7 +175,11 @@ jobs:
               done ) &
             HB=$!
 
-            if timeout 2700 repo sync -c --no-clone-bundle --no-tags --prune -j4 --verbose; then
+            # -j16 rather than -j4: this sync is network-bound (989 small
+            # clones), not CPU-bound, so the core count is the wrong limit.
+            # On a warm cache the objects are already in .repo/projects, so
+            # this mostly just materialises the working tree.
+            if timeout 2700 repo sync -c --no-clone-bundle --no-tags --prune -j16 --verbose; then
               kill "$HB" 2>/dev/null || true
               OK=1
               break
@@ -174,6 +195,16 @@ jobs:
             exit 1
           fi
           echo "sync complete: $(du -sh . | cut -f1)"
+
+      # Save before Drop .repo deletes the thing being cached. continue-on-error
+      # so a cache failure can never fail a build that is otherwise fine.
+      - name: Save source cache
+        if: steps.synccache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: aera/.repo
+          key: aera-sync-${{ env.MANIFEST_BRANCH }}-v1
 
       - name: Add the device tree
         run: |
@@ -199,13 +230,16 @@ jobs:
       # ---------------------------------------------------------------------
       # Build
       # ---------------------------------------------------------------------
-      # GOGC/GOMEMLIMIT keep Soong's Go heap inside the runner's RAM. On the
-      # 16 GB public runner 12 GiB is safe; the 8 GB private runner needed
-      # 5 GiB and still died, which is why this repo has to be public.
+      # GOGC/GOMEMLIMIT/GOMAXPROCS keep Soong's Go heap inside the runner's
+      # RAM. Measured on this exact runner class (16 GB) by ILYESwsa's F11
+      # workflow: soong_build was OOM-killed at ~13.6 GB RSS. 11 GiB plus the
+      # 30 GB swap above is the combination that survives; 12 GiB does not
+      # leave enough for the compilers.
       - name: Build
         env:
-          GOGC: "50"
-          GOMEMLIMIT: "12GiB"
+          GOGC: "40"
+          GOMEMLIMIT: "11GiB"
+          GOMAXPROCS: "2"
           ALLOW_MISSING_DEPENDENCIES: "true"
         run: |
           cd "${WORKDIR}"
@@ -228,6 +262,33 @@ jobs:
             exit 1
           fi
 
+          # Build the boot-HAL ABI shim before the full build. It takes seconds
+          # and lets a wrong symbol name fail here instead of 90 minutes later.
+          # The shim is then placed on the recovery overlay path, which is the
+          # mechanism this tree already uses to get the MTK boot HAL prebuilt
+          # into /system/lib64/hw/ of the ramdisk.
+          m libaera_boot_trim
+
+          SHIM=$(find "out/target/product/${DEVICE}" -name libaera_boot_trim.so -print -quit)
+          if [ -z "${SHIM}" ]; then
+            # 'm <module>' may only produce the Soong intermediate; that is
+            # still the exact .so we want on the ramdisk.
+            SHIM=$(find out/soong/.intermediates -name libaera_boot_trim.so -print -quit 2>/dev/null)
+          fi
+          if [ -z "${SHIM}" ]; then
+            echo "::error::libaera_boot_trim.so was not produced by 'm libaera_boot_trim'"
+            exit 1
+          fi
+          echo "shim built: ${SHIM}"
+          if ! readelf -sW "${SHIM}" | grep -q '_ZN7android4base4TrimERKNSt3__112basic_stringIcNS1_11char_traitsIcEENS1_9allocatorIcEEEE'; then
+            echo "::error::libaera_boot_trim.so does not export android::base::Trim(std::string const&)"
+            readelf -sW "${SHIM}" | grep -i trim || true
+            exit 1
+          fi
+          mkdir -p "${DEVICE_PATH}/recovery/root/system/lib64"
+          cp -f "${SHIM}" "${DEVICE_PATH}/recovery/root/system/lib64/"
+          ls -l "${DEVICE_PATH}/recovery/root/system/lib64/libaera_boot_trim.so"
+
           set +e
           mka adbd "${BUILD_TARGET}"
           rc=$?
@@ -242,6 +303,23 @@ jobs:
           fi
 
           echo "BUILD_RC=$rc"
+
+          # A green build that silently omits the shim would send a still-broken
+          # image to the phone, so verify the staged recovery root -- that is
+          # exactly what gets packed into the ramdisk.
+          if [ "$rc" -eq 0 ]; then
+            SHIM_IN_ROOT=$(find "out/target/product/${DEVICE}" \
+              -path '*recovery/root/system/lib64/libaera_boot_trim.so' -print -quit 2>/dev/null)
+            if [ -z "${SHIM_IN_ROOT}" ]; then
+              echo "::error::libaera_boot_trim.so is missing from the staged recovery root; the ramdisk would ship without the boot-HAL shim"
+              find "out/target/product/${DEVICE}" -maxdepth 2 -type d 2>/dev/null | head -40 || true
+              rc=1
+            else
+              echo "boot-HAL shim staged at: ${SHIM_IN_ROOT}"
+              readelf -sW "${SHIM_IN_ROOT}" | grep -i trim || true
+            fi
+          fi
+
           df -h .
           free -h
           exit "$rc"

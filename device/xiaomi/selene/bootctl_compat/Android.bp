@@ -1,0 +1,23 @@
+// Copyright (C) 2026 AERA Recovery Project contributors
+// SPDX-License-Identifier: Apache-2.0
+//
+// libaera_boot_trim: one-symbol ABI shim for the Android 11 MediaTek
+// boot-control HAL prebuilt. See trim_shim.cpp for the full story.
+//
+// This is a platform (not vendor) module so that it links the same
+// /system/lib64/libc++.so the recovery ramdisk already carries.
+
+cc_library_shared {
+    name: "libaera_boot_trim",
+    srcs: ["trim_shim.cpp"],
+
+    // android::base::Trim must be exported from the dynamic symbol table;
+    // AOSP's default -fvisibility-inlines-hidden does not affect it, but be
+    // explicit rather than depend on that.
+    cflags: [
+        "-Wall",
+        "-fvisibility=default",
+    ],
+
+    stl: "libc++",
+}

@@ -1,44 +1,159 @@
 # Handoff / current status
 
-Last updated: 2026-11-13
+Last updated: 2026-11-14 (run #3 flashed; boot-HAL ABI fix implemented, not yet pushed)
 
-## Where this stands
+## Read this first
 
-The build runs **directly on a GitHub-hosted runner**, using the recipe the
-other AERA device ports use (AzzyC's `Action-OFRP-Builder`, 14/20 successes at
-78-156 min on the same manifest).
+**The image builds and boots. It hangs on the boot logo because of one missing
+symbol in a vendor prebuilt, and the fix for that is written and unpushed.**
 
-- Workflow: `.github/workflows/build-aera.yml`
-- Actions: https://github.com/GlitchedBlue/android_device_xiaomi_selene-AERA/actions
-- Repo is **public** (required — see below)
-- Expect **~1.5-2.5 hours** per attempt
-- Source sync alone is ~20 min and does not change between attempts, so a
-  config error costs a full round trip. That is why the whole board/product
-  config was audited against the reference index, not just fixed one error at
-  a time.
+- Run #3: id `43503314394`, commit `b021eef`, branch `aera-16.0` — **success**
+- Image flashed by the user. Phone reaches AERA recovery: `adb` is live,
+  `product:aera_selene`, kernel healthy, no crash.
+- `recovery` (pid 367), `keymaster@4.1-service.beanpod`, `adbd` and `ueventd`
+  are all running, uptime 13+ min, `aera_selene-eng 99.87.36 BP2A.250605.031.A2`,
+  SDK 36, fbdev graphics init OK (`framebuffer: 5 (1080 x 2400)`).
+- So: build, boot header, MTK offsets, kernel, init, adbd, keymaster and the
+  ramdisk are all **correct**. The failure is one HIDL service.
 
-On success the images are published to a GitHub release tagged
-`aera-selene-<run id>`:
+## The actual bug (root-caused, not a guess)
 
-    https://github.com/GlitchedBlue/android_device_xiaomi_selene-AERA/releases
+`boot-hal-1-2` crash-loops roughly every 5 s, forever:
+
+```
+E HidlServiceManagement: Failed to dlopen android.hardware.boot@1.0-impl-1.2-mtkimpl.so:
+    dlopen failed: cannot locate symbol
+    "_ZN7android4base4TrimERKNSt3__112basic_stringIcNS1_11char_traitsIcEENS1_9allocatorIcEEEE"
+init: Service 'boot-hal-1-2' (pid N) exited with status 1
+I hwservicemanager: Since android.hardware.boot@1.0::IBootControl/default is not
+    registered, trying to start it as a lazy HAL
+I HidlServiceManagement: getService: Trying again for
+    android.hardware.boot@1.0::IBootControl/default...
+```
+
+That mangled name is `android::base::Trim(std::string const&)`. **Android 13
+replaced it with a `std::string_view` overload**, so the Android 11 MediaTek
+prebuilt cannot be dlopen()ed against Android 16's `libbase`.
+
+Recovery calls `IBootControl::getService()` during startup, `hwservicemanager`
+retries the lazy HAL forever, and the retry loop is **infinite** — so the UI
+thread never draws. `recovery` sits in `futex_wait_queue_me` with one
+`HwBinder:367_1` thread parked in `binder_ioctl_write_read`. It is a wait, not
+a crash.
+
+Scope was measured, not assumed. Pulling `bootimpl.so` plus all 13 of its
+dependency libraries off the phone and resolving every undefined symbol:
+
+```
+undefined symbols in impl : 160
+symbols available in deps  : 6102
+== UNRESOLVED (would fail dlopen) ==
+    _ZN7android4base4TrimERKNSt3__112basic_stringIcNS1_11char_traitsIcEENS1_9allocatorIcEEEE
+unresolved count: 1
+```
+
+**One symbol out of 160.** The failing `.so` on the device is byte-identical
+(SHA256 `63191FE1...CC168`) to
+`device/xiaomi/selene/recovery/root/system/lib64/hw/android.hardware.boot@1.0-impl-1.2-mtkimpl.so`.
+
+### What it is NOT
+
+- **Not decryption / FBE / keymaster.** `I:Can't probe device /dev/block/mmcblk0p53`
+  is *expected*: `/data` is metadata-encrypted (`dm-default-key`), so blkid
+  cannot read a raw f2fs signature. `dm-7` is already named `userdata`.
+  Decryption never got a chance to run — the process blocks before it.
+- **Not `AERA_USE_FSCRYPT_POLICY`**, not the theme, not the UI, not the kernel.
+- **Not `AB_OTA_UPDATER` / `ENABLE_VIRTUAL_AB`.** selene is genuinely A/B:
+  `boot_a`/`boot_b`, `vbmeta_system_a/b`, `ro.boot.slot_suffix=_a`. The
+  original PBRP tree sets both flags identically. **Do not change them.**
+
+### The fix (implemented locally, unpushed)
+
+A ~10 KB shim re-exporting the one missing symbol, `LD_PRELOAD`ed into the HAL:
+
+| File | Change |
+| --- | --- |
+| `device/xiaomi/selene/bootctl_compat/trim_shim.cpp` | **new** — `android::base::Trim(const std::string&)` |
+| `device/xiaomi/selene/bootctl_compat/Android.bp` | **new** — `cc_library_shared` `libaera_boot_trim`, `stl: "libc++"`, `-fvisibility=default` |
+| `device/xiaomi/selene/device.mk` | `PRODUCT_PACKAGES += libaera_boot_trim` |
+| `device/xiaomi/selene/recovery/root/init.recovery.mt6768.rc` | `export LD_PRELOAD /system/lib64/libaera_boot_trim.so` in `on init` |
+| `.github/workflows/build-aera.yml` | builds the shim first, `readelf`-asserts the exact mangled symbol, copies it onto the recovery overlay, and fails the run if the staged recovery root lacks it |
+
+Two mechanism choices worth keeping:
+
+- **`export`, not a service-scoped `setenv`.** The boot HAL's service
+  definition is a build-installed `.rc` we do not own, so overriding it would
+  race the installer. `export` is already used one line above for
+  `LD_LIBRARY_PATH`, and it provably reaches services: keymaster has a hard
+  `DT_NEEDED` on `libTEECommon.so` (which lives in `/vendor/lib64`), has **no
+  RUNPATH**, and loads fine — only the global `export LD_LIBRARY_PATH` can be
+  putting `/vendor/lib64` on its search path.
+- **Overlay copy, not `TARGET_RECOVERY_DEVICE_MODULES`.** That variable does
+  not exist in Android 16's build system. `recovery/root/` is the mechanism
+  this tree already uses to get the MTK boot HAL into `/system/lib64/hw/`.
+
+A missing `LD_PRELOAD` entry is non-fatal to the linker, so this cannot make
+the image less bootable than it already is: worst case the symbol stays missing
+and the HAL keeps crash-looping exactly as before.
+
+## DO NOT PUSH
+
+Eight files are modified locally and deliberately **unpushed**:
+
+| File | Change |
+| --- | --- |
+| `.github/workflows/build-aera.yml` | `.repo` cache steps, `GOGC=40` / `GOMEMLIMIT=11GiB` / `GOMAXPROCS=2`, `-j16` sync, `cpio` + `xz-utils`, shim build + symbol assertion + recovery-root verification |
+| `device/xiaomi/selene/BoardConfig.mk` | `BUILD_BROKEN_MISSING_REQUIRED_MODULES := true` |
+| `device/xiaomi/selene/aera_selene.mk` | dropped `AERA_WORKAROUND_BACKUP_BUG` / `AERA_OPTIONS_LIST_NUM` |
+| `device/xiaomi/selene/device.mk` | `PRODUCT_PACKAGES += libaera_boot_trim` |
+| `device/xiaomi/selene/bootctl_compat/trim_shim.cpp` | new — the shim |
+| `device/xiaomi/selene/bootctl_compat/Android.bp` | new — shim module |
+| `device/xiaomi/selene/recovery/root/init.recovery.mt6768.rc` | `export LD_PRELOAD` for the shim |
+| `HANDOFF.md` | this file |
+
+Pushing any `device/**` or workflow change **triggers a build**, which is
+exactly what we want next — but only after the user says go, so a stray push
+cannot race a run the user is waiting on.
 
 ## Run history
 
-| Run | Result | Cause |
-| --- | --- | --- |
-| #1 (`43495414023`) | failure, 25 min | `PRODUCT_USE_DYNAMIC_PARTITIONS` set in `BoardConfig.mk` -> `cannot assign to readonly variable` |
-
-Run #1 got all the way through `Maximize build space`, deps and a clean
-76 GB sync. It died in 20 seconds at `lunch`, which is a *good* failure: the
-infrastructure works, the tree was wrong.
+| Run | Result | Reached | Cause |
+| --- | --- | --- | --- |
+| #1 `43495414023` | failure, 25 min | `lunch` | `PRODUCT_USE_DYNAMIC_PARTITIONS` in `BoardConfig.mk` -> `cannot assign to readonly variable` |
+| #2 `43501925957` | failure, 4 min | deps | `libncurses5` / `lib32ncurses5-dev` do not exist on Ubuntu 24.04; one bad name aborts the whole apt transaction |
+| #3 `43503314394` | **success** | boots to recovery, UI blocked | boot-HAL prebuilt ABI break (one symbol) — fix written, see above |
 
 ## Next time you sit down
 
-1. Open the Actions tab. If a run is `in_progress`, wait.
-2. `success` -> download the image from the release tag.
-3. `failure` -> read the failing step. Retry as-is with "Re-run failed jobs"
-   before changing anything; these builds fail intermittently on the runner.
-   But read the log first: a config/make error reproduces every time.
+1. Push the change set above (it triggers run #4).
+2. In run #4's log, the `Build` step should print
+   `shim built: ...`, `boot-HAL shim staged at: ...` and a `readelf` line
+   containing `_ZN7android4base4Trim...`. If any of those is missing the run
+   fails early on purpose — read the `::error::` line, not the tail.
+3. Flash the image and watch `adb logcat`:
+   - **Fixed** if `Failed to dlopen ... Trim` is gone and
+     `boot-hal-1-2` stays up (`getprop init.svc.boot-hal-1-2` -> `running`).
+     The UI should then draw.
+   - **Still broken** if the dlopen error persists: the `LD_PRELOAD` did not
+     reach the process, or the lib landed somewhere other than
+     `/system/lib64`. Check `adb shell ls -l /system/lib64/libaera_boot_trim.so`
+     and `adb shell cat /proc/<boot-hal pid>/environ`.
+4. Anything after that (decryption, WLAN, browser sandbox) is ordinary
+   debugging — see "Open risk: decryption".
+
+If a failure traces to keymaster / relink / FBE, see "Open risk: decryption".
+
+
+### How to push (no git/gh installed locally)
+
+All pushes go through the GitHub REST Git Data API from PowerShell using the PAT
+in `.gh_token`: create blobs (base64) -> create tree with `base_tree` = current
+HEAD tree -> create commit -> `PATCH /git/refs/heads/aera-16.0`. Only the 4 files
+above need to go in the tree.
+
+Gotcha that cost time: build the tree URL by string concatenation, not
+`"$api/git/trees/$head?recursive=1"` — PowerShell mangles the `?` and GitHub
+returns 404.
 
 ## Pipeline as it stands
 
@@ -48,47 +163,104 @@ infrastructure works, the tree was wrong.
 | Device tree | `device/xiaomi/selene/` |
 | Docs | `docs/BUILDING.md` |
 
-Sequence: `slimhub` cleanup -> 30 GB swap -> deps + `repo` ->
-`repo init --depth=1` AERA 16 -> `repo sync` with retries -> copy device tree ->
-`rm -rf .repo` -> `export AERA_BUILD_DEVICE=selene` ->
+Sequence: `slimhub` cleanup -> 30 GB swap -> deps + `repo` -> restore `.repo`
+cache -> `repo init --depth=1` -> `repo sync` with retries -> save cache ->
+copy device tree -> `rm -rf .repo` -> `export AERA_BUILD_DEVICE=selene` ->
 `source build/envsetup.sh` -> `lunch twrp_selene-bp2a-eng` ->
 `mka adbd bootimage` (falls back to `recoveryimage`) -> release upload.
+
+Workflow validated with `yaml.safe_load`: 14 steps, order correct:
+
+```
+Restore source cache -> Sync AERA sources -> Save source cache
+  -> Add the device tree -> Drop .repo -> Build -> Collect images
+  -> Upload workflow artifact -> Publish the release -> Report failure
+```
 
 ## Facts learned the hard way (do not regress)
 
 - **The repository must stay public.** A private repo gets a 2 vCPU / 8 GB
-  runner and Soong is OOM-killed ~48 minutes into the build. The AERA port
-  `HIZVOICE/...camellia-AERA` is private and went 0-for-16; every port that
-  produces images is public. Public also means unlimited Actions minutes.
-- **Run on `ubuntu-24.04`, and do NOT use `maximize-build-space`.** The 24.04
-  public image has a **145 GB** root disk (measured from a successful AzzyC
-  run). On 22.04, `easimon/maximize-build-space` pooled us down to **84 GB** —
-  it was actively costing space, and it failed with `fallocate: invalid length
-  value specified` if the reserves were lowered.
-- **30 GB of swap** (`pierotofy/set-swap-space`) is what lets `-j$(nproc)` on 4
-  cores survive Soong's peak RSS in 16 GB of RAM.
+  runner and Soong is OOM-killed ~48 minutes in. The AERA port
+  `HIZVOICE/...camellia-AERA` is private and went 0-for-16. Public also means
+  unlimited Actions minutes.
+- **Run on `ubuntu-24.04` and do NOT use `maximize-build-space`.** Measured:
+  24.04 gives `/dev/root 145G`, 110 GB free. On 22.04 the same action pooled us
+  down to 84 GB with 25 GB free. It was costing us 61 GB.
+- **30 GB of swap** (`pierotofy/set-swap-space`) is what lets the build survive
+  Soong's peak RSS in 16 GB of RAM.
+- **`soong_build` is silent for 5-15 minutes.** It is single-threaded graph
+  analysis and prints nothing until it finishes. That is not a hang. ILYESwsa
+  measured it OOM-killed at ~13.6 GB RSS on this runner class.
+- **Product variables are readonly in `BoardConfig.mk`.** `product_config.mk`
+  runs before `board_config.mk` and calls `readonly-product-vars`, so anything
+  `PRODUCT_*` assigned in a board config is a hard make error. It belongs in the
+  product make file (`device.mk`).
 - **`rm -rf .repo` before building** reclaims ~18 GB. `.repo` holds the history
   of ~1000 projects and is useless once the working tree exists.
 - **`AERA_BUILD_DEVICE` must be exported before `source build/envsetup.sh`**
-  (AERA wiki). Setting it inside the vendorsetup guard is too late and lets
-  another tree's exports leak in.
-- **Product variables are readonly in `BoardConfig.mk`.** `product_config.mk`
-  runs before `board_config.mk` and calls `readonly-product-vars`, so anything
-  `PRODUCT_*` assigned in a board config is a hard make error. It goes in the
-  product make file (`device.mk`).
+  (AERA wiki). Setting it inside the vendorsetup guard is too late.
 - The AERA manifest is ~989 projects; `remove-minimal.xml` removes 601 of them.
   Composition: `default.xml` -> `twrp-default.xml` -> `aera.xml` +
-  `remove-minimal.xml`, so `vendor/twrp` and `vendor/recovery` are both present.
+  `remove-minimal.xml`.
 - `selene` is recovery-as-boot (`BOARD_USES_RECOVERY_AS_BOOT := true`), so the
   target is `bootimage`, not `recoveryimage`.
-- The products keep the `twrp_` prefix in the lunch name; that is not the UI
-  branding (AERA wiki). The combo is `twrp_selene-bp2a-eng` — there is no
-  `aera_selene` product and `twrp_selene-eng` is not a valid combo.
+- The lunch combo is `twrp_selene-bp2a-eng`. There is no `aera_selene` product
+  and `twrp_selene-eng` is not a valid combo (AERA 16 needs the `bp2a` release
+  name).
+- MTK boot offsets verified against the original PBRP selene tree:
+  `BOARD_RAMDISK_OFFSET 0x07c08000` / `BOARD_KERNEL_TAGS_OFFSET 0x0bc08000`,
+  `BOARD_KERNEL_BASE 0x40078000`, pagesize 2048, header version 2. All correct,
+  no change needed.
+- **Android 13 changed `android::base::Trim` to take `std::string_view`.** Any
+  Android 11/12 vendor prebuilt that imports the old `std::string const&`
+  overload will fail `dlopen` on Android 16 with
+  `cannot locate symbol "_ZN7android4base4TrimERKNSt3__112basic_string..."`.
+  Check every prebuilt in `recovery/root` for this before blaming recovery code.
+  `libaera_boot_trim` (see above) is the shim for the boot HAL.
+- **A `dlopen` failure of a HIDL service is not survivable in recovery.** The
+  `hwservicemanager` lazy-HAL retry and `BootControlClient::WaitForService()`
+  are both infinite, so a missing HAL blocks the UI forever instead of
+  degrading. A crash-looping service in `dmesg` is therefore a top-priority
+  symptom, not noise.
+- **`TARGET_RECOVERY_DEVICE_MODULES` does not exist in Android 16.** To get a
+  file into the recovery ramdisk, either use `PRODUCT_PACKAGES` with
+  `recovery_available: true`, or drop it on the `recovery/root/` overlay (which
+  is what this tree does, and what the MTK HAL prebuilts rely on).
+- **init `export` reaches service processes.** Proven: keymaster has a hard
+  `DT_NEEDED` on `libTEECommon.so` (in `/vendor/lib64`), has no RUNPATH, and
+  only the global `export LD_LIBRARY_PATH` in `init.recovery.mt6768.rc` can be
+  putting that directory on its search path. Use `export` when the target
+  service's `.rc` is build-installed and you cannot own it.
+
+## Source caching: measured, not guessed
+
+From ILYESwsa's `pbrp_device_oppo_f11` run #8 (same manifest, same runner class):
+
+```
+Cache Size: ~17932 MB (18802899874 B)
+Cache restored successfully
+
+actions/cache/restore   3m39s
+repo sync --force-sync  3m46s
+total                  ~7m30s      (vs ~20m cold)
+```
+
+Two things worth remembering because they are counter-intuitive:
+
+- An **18.8 GB** cache entry restores fine despite the 10 GB free-tier figure.
+  Do not "fix" it by trimming the cached path.
+- `--force-sync` does **not** re-download; the objects are already in
+  `.repo/projects`. It only re-materialises the working tree.
+
+First run with the cache steps pays a one-time cost: cold 20 min sync, then an
+~18 GB cache upload. Only the second and later runs get the 12 minutes back.
+The save is `continue-on-error: true` so a cache failure can never fail a build,
+and it must run **before** `Drop .repo` or it caches a deleted directory.
 
 ## Config audit against the AERA reference (2026-10-15, 149 flags)
 
 Every `AERA_*` in the tree was checked for placement and for a real consumer in
-`aera_config.mk` / `aera_build.mk` / `AERA_A16.sh`. Fixes applied:
+`aera_config.mk` / `aera_build.mk` / `AERA_A16.sh`.
 
 | Flag | Was | Now |
 | --- | --- | --- |
@@ -96,40 +268,51 @@ Every `AERA_*` in the tree was checked for placement and for a real consumer in
 | `AERA_SCREEN_H` / `AERA_STATUS_H` | `aera_selene.mk` | `BoardConfig.mk` |
 | `AERA_MAINTAINER` / `AERA_NO_TREBLE_COMPATIBILITY_CHECK` | `aera_selene.mk` | `vendorsetup.sh`, inside the device guard |
 | `AERA_USE_FSCRYPT_POLICY` | `1` (= v1) | `2` (= v2, matches our `:v2` fstab) |
-| `AERA_DELETE_AROMAFM` / `AERA_DELETE_MAGISK_ADDON` | exported | removed — dead in A16, nothing reads them |
+| `AERA_DELETE_AROMAFM` / `AERA_DELETE_MAGISK_ADDON` | exported | removed — dead in A16 |
+| `AERA_WORKAROUND_BACKUP_BUG` / `AERA_OPTIONS_LIST_NUM` | set | removed (AzzyC: merged into OFox / UI does not rely on it) |
 
-Two flags the reference page does **not** list are nevertheless live in the A16
-backend, so they were kept:
+Note: `AERA_SCREEN_H` / `AERA_STATUS_H` / `AERA_MAINTAINER` are placed in the
+product `.mk` by *both* AzzyC (peridot) and ILYESwsa (F11), while the reference
+page says `BoardConfig.mk` / `vendorsetup.sh`. Both work — board config is
+parsed earlier, so it is the safer of the two. Do not treat the reference as
+wrong, but do not treat the product-mk placement as broken either.
 
-- `AERA_OPTIONS_LIST_NUM` -> `aera_config.mk:46` -> `aera_build.mk:724`
-- `AERA_WORKAROUND_BACKUP_BUG` -> `aera_config.mk:58` -> `aera_build.mk:819`
-  (the backend already defaults this to 1 when unset)
+`BUILD_BROKEN_MISSING_REQUIRED_MODULES` was verified legal before adding it: it
+is on AOSP 16's whitelist (`build/make/core/board_config.mk:181`), and an
+unlisted `BUILD_BROKEN_*` is itself a build error.
 
 ## Checked: the WLAN switch is correct
 
-`aera_selene.mk` sets `AERA_ENABLE_WLAN := 0` to disable WLAN. The wiki warns
-that some switches treat any non-empty value as enabled, so this was worth
-verifying rather than trusting.
+`aera_selene.mk` sets `AERA_ENABLE_WLAN := 0`. `aera_config.mk` maps it verbatim
+to `OF_ENABLE_WLAN`, and `aera_defaults.go` tests the literal `"1"`:
 
-Traced it end to end:
+```go
+if getMakeVars(ctx, "OF_ENABLE_WLAN") == "1" {
+    aeraFlags = append(aeraFlags, "-DOF_ENABLE_WLAN")
+}
+```
 
-- `bootable/recovery/aera_config.mk` maps it verbatim:
-  `aera-map-config,ENABLE_WLAN,OF_ENABLE_WLAN` -> `OF_ENABLE_WLAN := $(AERA_ENABLE_WLAN)`
-- `bootable/recovery/aera_defaults.go` compares against the literal `"1"`:
+So `"0"` really does keep WLAN off. Contrast with `AERA_USE_FSCRYPT_POLICY`,
+where `1` *does* mean v1. The semantics are per-flag; always check the consumer.
 
-  ```go
-  if getMakeVars(ctx, "OF_ENABLE_WLAN") == "1" {
-      aeraFlags = append(aeraFlags, "-DOF_ENABLE_WLAN")
-  }
-  ```
+## Open risk: decryption
 
-So `"0"` != `"1"` and WLAN stays off, exactly as intended. No change needed.
+**Not the current blocker.** Run #3 proved the hang happens *before* decryption
+runs: recovery blocks in `IBootControl::getService()` while the boot HAL
+crash-loops. `I:Can't probe device /dev/block/mmcblk0p53` is expected for a
+metadata-encrypted `/data` and is not an error. Revisit this section only if
+decryption itself fails *after* the UI appears.
 
-Note the contrast with `AERA_USE_FSCRYPT_POLICY`, where `1` *does* mean v1 and
-everything else means v2. The semantics are per-flag; check the consumer.
+We build with full crypto on (`AERA_INCLUDE_CRYPTO`, `_FBE`,
+`_FBE_METADATA_DECRYPT`, `AERA_USE_FSCRYPT_POLICY := 2`, MTK keymaster prebuilts
+plus a hand-written `AERA_RECOVERY_ADDITIONAL_RELINK_LIBRARY_FILES` list).
+
+ILYESwsa ships `AERA_INCLUDE_CRYPTO := false` with the comment *"the first goal
+is only to boot"*. If a build failure traces back to keymaster / relink / FBE,
+turn crypto off, get a booting image, then re-enable it as a second iteration.
+A recovery you can boot and flash from beats a perfect one that never compiles.
 
 ## Secrets
 
-- `CRAVE_USERNAME` / `CRAVE_TOKEN` are now unused; they can be deleted.
 - `.gh_token` in this folder is a personal PAT used for the REST pushes.
   **Revoke it when the project is done.**

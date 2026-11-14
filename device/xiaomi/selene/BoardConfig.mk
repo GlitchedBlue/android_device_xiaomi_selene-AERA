@@ -19,6 +19,10 @@ DEVICE_PATH := device/xiaomi/selene
 ALLOW_MISSING_DEPENDENCIES := true
 BUILD_BROKEN_DUP_RULES := true
 BUILD_BROKEN_ELF_PREBUILT_PRODUCT_COPY_FILES := true
+# The AERA manifest strips 601 projects (remove-minimal.xml), so `required:`
+# modules referenced by recovery's Android.bp are frequently absent. Without
+# this, the product-module check turns those into a hard failure.
+BUILD_BROKEN_MISSING_REQUIRED_MODULES := true
 BUILD_BROKEN_PLUGIN_VALIDATION := soong-libaosprecovery_defaults soong-libguitwrp_defaults soong-libminuitwrp_defaults soong-vold_defaults
 
 # ---------------------------------------------------------------------------

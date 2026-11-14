@@ -3,6 +3,21 @@ import /init.microtrust.rc
 on init
     export LD_LIBRARY_PATH /system/lib64:/vendor/lib64:/vendor/lib64/hw:/system/lib64/hw
 
+    # The stock MediaTek boot-control HAL is an Android 11 prebuilt that imports
+    # android::base::Trim(std::string const&). Android 13 replaced that overload
+    # with a std::string_view one, so dlopen() fails with
+    #   cannot locate symbol "_ZN7android4base4TrimERKNSt3__112basic_string..."
+    # boot-hal-1-2 then exits with status 1 in a loop and recovery blocks
+    # forever waiting for android.hardware.boot@1.0::IBootControl/default,
+    # which is why the UI never draws.
+    #
+    # libaera_boot_trim re-exports just that symbol. `export` (not a
+    # service-scoped `setenv`) is required because the HAL service definition
+    # lives in a build-installed .rc we do not own. Missing LD_PRELOAD entries
+    # are non-fatal to the linker, so this cannot break anything that
+    # currently works.
+    export LD_PRELOAD /system/lib64/libaera_boot_trim.so
+
 on post-fs
     # Support A/B feature for EMMC and UFS boot region
     wait /dev/block/mmcblk0boot0 2
