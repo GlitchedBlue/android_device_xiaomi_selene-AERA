@@ -1,7 +1,8 @@
 # Handoff / current status
 
 Last updated: 2026-11-14 (recovery boots, decrypts and browses files; fixes
-committed; one build left to make it all permanent)
+committed; run #7 is the first image with the Mali backend compiled in — dormant,
+because the vendor has no gralloc1)
 
 ## Read this first
 
@@ -385,27 +386,55 @@ ramdisk content, so the boot image was rebuilt locally instead of waiting:
 because the backend validates the name against TWRP mount points. `aera backup
 --parts /boot` works. The GUI is unaffected (it passes `/boot`).
 
-## Mali GPU: the stock backend cannot initialize on selene (verified, not guessed)
+## Mali GPU: the stock stack is gralloc4, and the backend needs gralloc1 (verified on the device)
 
 apkreader's `mali-testing` backend is merged and compiles, but it **cannot**
-accelerate selene. This is not a configuration mistake; the required HAL does
-not exist on the device. The evidence, from the stock
-`V14.0.7.0.TKUMIXM` dump (`Jiovanni-dump/redmi_selene_dump`, branch
-`missi_phoneext4_global-user-13-...`) and from the files themselves:
+accelerate selene. This is not a configuration mistake; the HAL it calls does
+not exist on the device. This was first inferred from the public
+`V14.0.7.0.TKUMIXM` dump; it has since been **verified on the live device**, and
+the live run corrected two things the dump had wrong.
 
-| Path | Size | What it actually is |
+### Live evidence: the whole vendor stack resolves under AERA 16
+
+`/system/bin/selene-gpu-test.sh` was run under AERA 16 (SDK 36) with the stock
+volumes bound under `/gpu`. It stages `/gpu/lib64` and runs `linker64 --list` on
+each library, which reports every dependency the linker can actually resolve.
+
+| Path | Size (live) | Result |
 | --- | --- | --- |
-| `vendor/lib64/egl/libGLES_mali.so` | 39,386,416 | the real Mali driver; NEEDED includes `libnativewindow`, `libged`, `libgpu_aux`, `libgpud`, `libgralloc_extra`, `android.hardware.graphics.mapper@4.0`, `libgralloctypes`, `libhidlbase` |
-| `vendor/lib64/hw/hwcomposer.mt6768.so` | 1,032,864 | HWC2 composer, exports `HMI` |
-| `vendor/lib64/hw/gralloc.default.so` | 20,080 | **AOSP fbdev gralloc0**: exports `HMI`, `fb_device_open`, `mapFrameBufferLocked`, imports `ashmem_create_region` |
-| `vendor/lib64/hw/android.hardware.graphics.allocator@4.0-impl-mediatek.so` | 73,872 | HIDL allocator, exports `HIDL_FETCH_IAllocator` |
-| `vendor/lib64/hw/android.hardware.graphics.mapper@4.0-impl-mediatek.so` | 140,664 | HIDL mapper, exports `HIDL_FETCH_IMapper` |
+| `vendor/lib64/egl/libGLES_mali.so` | 39,702,064 | **67 dependencies, zero missing symbols** |
+| `vendor/lib64/hw/hwcomposer.mt6768.so` | 1,313,049 | resolves fully, HWC2 (`common.version >> 24 == 2`) |
+| `vendor/lib64/hw/android.hardware.graphics.allocator@4.0-impl-mediatek.so` | 65,952 | resolves fully, exports `HIDL_FETCH_IAllocator` |
+| `vendor/lib64/hw/android.hardware.graphics.mapper@4.0-impl-mediatek.so` | 140,936 | resolves fully, exports `HIDL_FETCH_IMapper` |
+| `vendor/lib64/hw/gralloc.default.so` | 23,760 | AOSP fbdev **gralloc0**: `HMI`, `fb_device_open`, `mapFrameBufferLocked`, imports `ashmem_create_region` |
 
-There is **no gralloc1 module anywhere on the device**. `gralloc.mt6768.so` was
-an Android 10/11 MediaTek artifact; the Android 13 vendor image replaced it with
-gralloc4/HIDL. `gralloc.default.so` is not a substitute: it is the generic fbdev
-gralloc0 module, so opening it through `gralloc1_open()` hands the backend a
-mismatched function table.
+So the open question the probe existed to answer is answered: **an
+Android 12/13-era vendor graphics stack does load inside an Android 16 linker
+namespace.** `libGLES_mali.so` needs `libnativewindow`, `libged`, `libgpu_aux`,
+`libgpud`, `libgralloc_extra`, `android.hardware.graphics.mapper@4.0`,
+`libgralloctypes` and `libhidlbase`, and all of them are satisfied.
+
+### The one missing piece: there is no gralloc1 module
+
+The device is **gralloc4/HIDL**, not gralloc1. `find` across both partitions
+returns exactly two gralloc files, and both are the same thing:
+
+```
+/vendor/lib64/hw/gralloc.default.so     23,760   AOSP fbdev gralloc0
+/vendor/lib/hw/gralloc.default.so       11,772   AOSP fbdev gralloc0
+```
+
+- `/system/lib64/hw/` and `/system/lib/hw/` contain **no gralloc at all** — only
+  the audio impls (`audio@2.0` … `audio@7.1`, `audio.sysbta.default.so`). All
+  graphics HALs live on `/vendor/lib64/hw`. Do not go looking on `/system`.
+- The vendor provides gralloc4 as HIDL passthroughs:
+  `allocator@4.0-impl-mediatek.so` + `mapper@4.0-impl-mediatek.so`, and the Mali
+  driver is itself a gralloc4 client (it NEEDs `mapper@4.0` and
+  `libgralloctypes`). That is what the stock framework uses.
+- `gralloc.mt6768.so` was an Android 10/11 MediaTek artifact and is gone.
+  `gralloc.default.so` is **not** a substitute: opening the generic fbdev
+  gralloc0 module through `gralloc1_open()` hands the backend a mismatched
+  function table.
 
 The backend needs exactly this, from `aeraui/core/mali_display.cpp`:
 
@@ -414,6 +443,23 @@ The backend needs exactly this, from `aeraui/core/mali_display.cpp`:
   SET_CONSUMER_USAGE, ALLOCATE, GET_STRIDE, RELEASE}`, then `GET_STRIDE` on each
   of 2-3 scanout buffers;
 - an HWC2 `hwc2_device_t` whose `common.version >> 24 == 2` (satisfied).
+
+### False lead: the gralloc1 strings are clients, not providers
+
+`libgpud.so` and `sensors.mt6768.so` both contain `cannot open gralloc1 device
+(%s)` and `GrallocHalWrapper::mapGralloc1Error`. That is **client** code — the
+MTK userspace half of the old gralloc1 API, left behind after the provider was
+removed. There is no `HMI`-exporting gralloc1 module on the device for either of
+them to open, and neither one is a provider. Do not read those strings as
+evidence that a gralloc1 module exists.
+
+### Correction: the `memset_explicit` failure was OrangeFox, not selene
+
+An earlier OrangeFox run reported `libGLES_mali.so` as needing `memset_explicit`,
+which would have meant the driver could never load on this tree. That was an
+artifact of OFox's ramdisk being Android 12L (SDK 32). **AERA 16's libc exports
+`memset_explicit`**, and the driver resolves cleanly under it. Ignore any
+OFox-era dependency failure when judging the Mali path.
 
 ### Why a gralloc1 shim was rejected
 
@@ -441,10 +487,13 @@ means a future gralloc1 module only needs a property change:
   `GpuRenderer::Initialize()` returns false (`gpu_renderer.cpp:121-128`), after
   which `engine.cpp:293-309` falls back to the software renderer. Do not point it
   at `gralloc.default.so`.
-- `selene-gpu-launch.sh` is the best-effort `on boot` stager. It normally finds
-  nothing: selene uses dynamic partitions, so `vendor` lives inside `super` and
-  has no `/dev/block/by-name/vendor` node until AERA maps it in-process, which is
-  long after `on boot`. Log: `/tmp/aera-gpu-boot.log`.
+- `selene-gpu-launch.sh` is the best-effort `on boot` stager. The by-name nodes
+  **do** exist on this device — `/dev/block/by-name/vendor -> /dev/block/dm-5`,
+  `system -> dm-2`, `super -> mmcblk0p52` — and `mount -o ro
+  /dev/block/by-name/vendor` succeeds, so dynamic partitions are not the obstacle
+  they were once assumed to be. It still normally stages nothing, because `on
+  boot` runs long before AERA has mapped `dm-5` for `vendor`. Log:
+  `/tmp/aera-gpu-boot.log`.
 - `selene-gpu-libraries.sh` builds `/gpu/lib64` from the stock
   system+vendor libraries (excluding `libc`/`libm`/`libdl`/`libdl_android`, which
   the namespace links to the recovery process).
@@ -458,15 +507,25 @@ means a future gralloc1 module only needs a property change:
 
   It binds the mounted volumes under `/gpu`, stages `/gpu/lib64`, runs
   `linker64 --list` on the four libraries, and greps the vendor `hw/` directory
-  for a gralloc1 provider. The `--list` output answers the only remaining open
-  question: whether the Android 13 vendor libraries resolve inside an Android 16
-  linker namespace. If they do not, the Mali path is finished on this vendor.
+  for a gralloc1 provider. Both of those questions are now settled (everything
+  resolves; no gralloc1 provider exists), so it is kept as a regression check for
+  a future vendor or a future backend.
 - The namespace mechanism itself is fine: `android_create_namespace` and
   `android_link_namespaces` are still exported by Android 16's
   `libdl_android.so` (`bionic/libdl/libdl_android.cpp`).
 
-**Bottom line: do not expect `Mali HWC2 GPU ready` on selene.** The UI stays on
-the software renderer at ~4 fps. Revisit only if a gralloc1 module appears.
+**Bottom line: do not expect `Mali HWC2 GPU ready` on selene with the current
+backend.** The UI stays on the software renderer at ~4 fps. The blocker is one
+missing HAL, not a driver problem, and there are exactly two ways it clears:
+
+1. **apkreader adds a gralloc4 path** to `mali_display.cpp` — allocate through
+   HIDL `allocator@4.0` and describe/lock through `mapper@4.0`, which is what the
+   stock framework does. This is the correct fix and needs no shim. The
+   workflow already tracks his `mali-testing` branch head, so it lands with no
+   change on this side.
+2. **A gralloc1 module appears** — it will not, on this vendor image.
+
+A gralloc1 shim over the HIDL impls stays rejected for the reason above.
 
 ## What is pushed / what is pending
 
@@ -495,9 +554,15 @@ On the branch:
 The workflow also switches `bootable/recovery` to apkreader's `mali-testing`
 branch, applies the four LVGL patches, and asserts that `mali_display.cpp`
 exists, that `aeraui/Android.bp` lists it, and that all three GPU scripts are
-staged executable in the recovery root.
+staged executable in the recovery root. The patch step is verified against his
+tree: `aeraui/patches/lvgl/` holds exactly the four patches the helper requires
+(`0001-enable-arm64-neon`, `0002-skip-disabled-rgb565-neon`,
+`0003-initialize-neon-tail-lanes`, `0004-gpu-texture-cache`), and
+`prepare-mali-lvgl.py` resolves `--lvgl` to `<tree>/external/lvgl` from
+`bootable/recovery/aeraui/tools/`, which is where the manifest puts it.
 
-Pending: **nothing but the build itself.**
+Pending: **the build itself.** Run #7 is the first image that contains the Mali
+integration at all — every earlier image predates it.
 
 ## Run history
 
@@ -508,6 +573,8 @@ Pending: **nothing but the build itself.**
 | #3 `43503314394` | **success** | boots to recovery, UI blocked | boot-HAL prebuilt ABI break (one symbol) |
 | #4 `43566176237` | **success** | decryption PIN screen (after live manifest patch) | shim fixed `dlopen`; VINTF refusal on boot@1.2 remained — manifest fix unpushed |
 | #5 `43586256262` | cancelled | — | superseded before the manifest-only image was built; the scoped-preload fix went in instead |
+| #6 `43629463339` | cancelled | — | Mali integration commit; cancelled on request to free the runner for OrangeFox testing |
+| #7 `43635914131` | running | — | first image with the Mali backend compiled in (dormant: no gralloc1) |
 
 ## Next time you sit down
 
@@ -524,7 +591,14 @@ Pending: **nothing but the build itself.**
 3. Confirm the preload regression is gone: flash any zip and check that the
    installer's `getprop`/`sh` do **not** die with
    `CANNOT LINK EXECUTABLE ... libaera_boot_trim.so not found`.
-4. If a backup fails with `EIO`, check `/proc/partitions` for `mmcblk1` before
+4. Confirm the Mali integration is at least inert, not harmful:
+   - `getprop ro.aera.gpu.gralloc` -> `gralloc.mt6768.so` (absent on purpose)
+   - `logcat -d -b all -s AeraGpu` -> the backend reports the failed load, and
+     the UI is still the software renderer (~4 fps). `Mali HWC2 GPU ready` here
+     would mean a gralloc1 provider appeared out of nowhere; treat it as a
+     surprise, not a win.
+   - `ls -l /system/bin/selene-gpu-*.sh` -> all three present and executable.
+5. If a backup fails with `EIO`, check `/proc/partitions` for `mmcblk1` before
    blaming the card — a removed card leaves a stale mount that EIOs forever
    (see "Storage" below). Internal `/sdcard` is a safe target meanwhile.
 
