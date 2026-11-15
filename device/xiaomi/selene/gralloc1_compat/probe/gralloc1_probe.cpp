@@ -155,9 +155,19 @@ int RunHwcProbe(const char* path) {
 // (unregister, close, dlclose), because that is the other half of the crash:
 // recovery aborts on a *worker* thread, i.e. while the vendor module is being
 // unloaded underneath it.
+//
+// Since then the composer has been reverse-engineered far enough to know that
+// registering HOTPLUG alone can never work: HWCMediator::deviceRegisterCallback
+// builds DisplayManager's listener and runs DisplayManager::init() only after
+// hotplug, vsync and refresh are all registered. So the default is now to
+// register all three (and then hotplug a second time, which makes MTK resend a
+// synthetic "display 0 connected"). --only-hotplug reproduces the original
+// single-callback run.
 volatile int g_hotplug_count = 0;
 volatile int g_hotplug_connected = 0;
 volatile unsigned long long g_hotplug_display = ~0ull;
+volatile int g_vsync_count = 0;
+volatile int g_refresh_count = 0;
 
 void HotplugCallback(hwc2_callback_data_t, hwc2_display_t display, int32_t state) {
   __atomic_add_fetch(&g_hotplug_count, 1, __ATOMIC_SEQ_CST);
@@ -170,7 +180,24 @@ void HotplugCallback(hwc2_callback_data_t, hwc2_display_t display, int32_t state
          static_cast<int>(gettid()));
 }
 
-int RunHotplugProbe(const char* path, bool teardown) {
+void VsyncCallback(hwc2_callback_data_t, hwc2_display_t display, int64_t timestamp) {
+  const int n = __atomic_add_fetch(&g_vsync_count, 1, __ATOMIC_SEQ_CST);
+  if (n <= 3) {
+    printf("vsync   : display=%llu ts=%lld tid=%d\n",
+           static_cast<unsigned long long>(display),
+           static_cast<long long>(timestamp), static_cast<int>(gettid()));
+  }
+}
+
+void RefreshCallback(hwc2_callback_data_t, hwc2_display_t display) {
+  const int n = __atomic_add_fetch(&g_refresh_count, 1, __ATOMIC_SEQ_CST);
+  if (n <= 3) {
+    printf("refresh : display=%llu tid=%d\n",
+           static_cast<unsigned long long>(display), static_cast<int>(gettid()));
+  }
+}
+
+int RunHotplugProbe(const char* path, bool teardown, bool all_three) {
   printf("hwc     : %s\n", path);
   void* library = dlopen(path, RTLD_NOW);
   if (library == nullptr) {
@@ -203,11 +230,46 @@ int RunHotplugProbe(const char* path, bool teardown) {
   }
 
   // Exactly what Initialize() does, on the caller's thread.
-  const int rc = reg(device, HWC2_CALLBACK_HOTPLUG, nullptr,
-                     reinterpret_cast<hwc2_function_pointer_t>(HotplugCallback));
-  printf("register: %d connected_right_after=%d callbacks=%d\n", rc,
+  //
+  // One caveat, reverse-engineered out of hwcomposer.mt6768.so: registering
+  // HOTPLUG alone is *not* enough. HWCMediator::deviceRegisterCallback only
+  // builds the DisplayManager listener and runs DisplayManager::init() once
+  // hotplug, vsync and refresh are all non-null (the check is in the shared
+  // tail at 0x679e0, so the order does not matter). Until that happens the
+  // display table is never filled in and display 0 stays "not connected".
+  //
+  // --only-hotplug keeps the old single-callback behaviour for comparison.
+  int rc = 0;
+  if (all_three) {
+    rc = reg(device, HWC2_CALLBACK_VSYNC, nullptr,
+             reinterpret_cast<hwc2_function_pointer_t>(VsyncCallback));
+    printf("register: vsync -> %d\n", rc);
+    rc = reg(device, HWC2_CALLBACK_REFRESH, nullptr,
+             reinterpret_cast<hwc2_function_pointer_t>(RefreshCallback));
+    printf("register: refresh -> %d\n", rc);
+    rc = reg(device, HWC2_CALLBACK_HOTPLUG, nullptr,
+             reinterpret_cast<hwc2_function_pointer_t>(HotplugCallback));
+    printf("register: hotplug -> %d\n", rc);
+  } else {
+    rc = reg(device, HWC2_CALLBACK_HOTPLUG, nullptr,
+             reinterpret_cast<hwc2_function_pointer_t>(HotplugCallback));
+    printf("register: hotplug -> %d\n", rc);
+  }
+  printf("register: connected_right_after=%d callbacks=%d\n",
          __atomic_load_n(&g_hotplug_connected, __ATOMIC_SEQ_CST),
          __atomic_load_n(&g_hotplug_count, __ATOMIC_SEQ_CST));
+
+  // DisplayManager::resentCallback() forwards a synthetic "display 0 connected"
+  // to the client callback when the hotplug callback is registered a second
+  // time, now that DisplayManager::init() has installed the listener. Cheap to
+  // try, and it is exactly what a client that re-registers would see.
+  if (all_three) {
+    const int again = reg(device, HWC2_CALLBACK_HOTPLUG, nullptr,
+                          reinterpret_cast<hwc2_function_pointer_t>(HotplugCallback));
+    printf("register: hotplug again -> %d connected=%d callbacks=%d\n", again,
+           __atomic_load_n(&g_hotplug_connected, __ATOMIC_SEQ_CST),
+           __atomic_load_n(&g_hotplug_count, __ATOMIC_SEQ_CST));
+  }
 
   // Poll for up to five seconds, printing the first time the state changes.
   int waited_ms = 0;
@@ -215,10 +277,12 @@ int RunHotplugProbe(const char* path, bool teardown) {
     usleep(100000);
     waited_ms += 100;
   }
-  printf("waited  : %d ms connected=%d callbacks=%d display=%llu\n", waited_ms,
-         __atomic_load_n(&g_hotplug_connected, __ATOMIC_SEQ_CST),
+  printf("waited  : %d ms connected=%d callbacks=%d display=%llu vsync=%d refresh=%d\n",
+         waited_ms, __atomic_load_n(&g_hotplug_connected, __ATOMIC_SEQ_CST),
          __atomic_load_n(&g_hotplug_count, __ATOMIC_SEQ_CST),
-         __atomic_load_n(&g_hotplug_display, __ATOMIC_SEQ_CST));
+         __atomic_load_n(&g_hotplug_display, __ATOMIC_SEQ_CST),
+         __atomic_load_n(&g_vsync_count, __ATOMIC_SEQ_CST),
+         __atomic_load_n(&g_refresh_count, __ATOMIC_SEQ_CST));
 
   // Whether the display is reachable without hotplug at all.
   if (configs != nullptr) {
@@ -241,6 +305,10 @@ int RunHotplugProbe(const char* path, bool teardown) {
   if (!teardown) {
     printf("teardown: skipped (--no-teardown); leaving the module loaded\n");
     return 0;
+  }
+  if (all_three) {
+    reg(device, HWC2_CALLBACK_VSYNC, nullptr, nullptr);
+    reg(device, HWC2_CALLBACK_REFRESH, nullptr, nullptr);
   }
   printf("unreg   : %d\n", reg(device, HWC2_CALLBACK_HOTPLUG, nullptr, nullptr));
   printf("close   : %d\n", device->common.close(&device->common));
@@ -401,11 +469,13 @@ int main(int argc, char** argv) {
   if (argc > 1 && strcmp(argv[1], "--hotplug") == 0) {
     const char* hwc_path = "/gpu/stock-vendor/lib64/hw/hwcomposer.mt6768.so";
     bool teardown = true;
+    bool all_three = true;
     for (int i = 2; i < argc; ++i) {
       if (strcmp(argv[i], "--no-teardown") == 0) teardown = false;
+      else if (strcmp(argv[i], "--only-hotplug") == 0) all_three = false;
       else if (strncmp(argv[i], "--", 2) != 0) hwc_path = argv[i];
     }
-    return RunHotplugProbe(hwc_path, teardown);
+    return RunHotplugProbe(hwc_path, teardown, all_three);
   }
 
   if (argc > 1 && strcmp(argv[1], "--lifecycle") == 0) {
