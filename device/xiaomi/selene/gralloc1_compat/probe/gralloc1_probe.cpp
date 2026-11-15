@@ -1185,14 +1185,16 @@ int RunEglProbe(const char* driver_path, const char* shim_path, uint32_t width,
   if (complete[0]) {
     gl_bind_framebuffer(GL_FRAMEBUFFER, framebuffers[0]);
     gl_viewport(0, 0, static_cast<GLsizei>(width), static_cast<GLsizei>(height));
-    gl_clear_color(0.0f, 1.0f, 0.0f, 1.0f);
+    // Red on purpose: green is symmetric under R/B swap, so it cannot say
+    // whether the import produced RGBA or BGRA. Red can.
+    gl_clear_color(1.0f, 0.0f, 0.0f, 1.0f);
     gl_clear(GL_COLOR_BUFFER_BIT);
     gl_finish();
     uint8_t pixel[4] = {0, 0, 0, 0};
     gl_read_pixels(0, 0, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, pixel);
-    printf("render  : cleared green, glReadPixels -> %u %u %u %u (want 0 255 0 255)\n",
+    printf("render  : cleared red, glReadPixels -> %u %u %u %u (want 255 0 0 255)\n",
            pixel[0], pixel[1], pixel[2], pixel[3]);
-    if (pixel[1] != 255) ++failures;
+    if (pixel[0] != 255) ++failures;
 
     // Independent check that the GPU wrote through to the dma-buf itself: map
     // it and look at the middle pixel. If this disagrees with glReadPixels the
