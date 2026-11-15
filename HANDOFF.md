@@ -1,8 +1,8 @@
 # Handoff / current status
 
-Last updated: 2026-11-14 (recovery boots, decrypts and browses files; fixes
-committed; run #7 is the first image with the Mali backend compiled in — dormant,
-because the vendor has no gralloc1)
+Last updated: 2026-11-15 (recovery boots, decrypts and browses files; the Mali
+driver now loads under the dieD 4.19 kernel; run #8 adds the gralloc1 shim that
+supplies the one HAL the backend was missing)
 
 ## Read this first
 
@@ -475,32 +475,139 @@ artifact of OFox's ramdisk being Android 12L (SDK 32). **AERA 16's libc exports
 `memset_explicit`**, and the driver resolves cleanly under it. Ignore any
 OFox-era dependency failure when judging the Mali path.
 
-### Why a gralloc1 shim was rejected
+### Correction: the shim is viable, and here is why the rejection was wrong
 
-Both vendor HIDL impls export their passthrough fetchers, so a shim looked
-possible. It is not worth it:
+An earlier revision of this document rejected a gralloc1 shim on the grounds
+that it would have to call `IAllocator::allocate` across an `sp<IAllocator>`
+boundary, putting AOSP 16's `libhidlbase` in the same process as the vendor's
+Android 12/13 copy. **That is not what a shim has to do.** MediaTek's allocator
+impl also exports the plain ARM entry points:
 
-- The shim would be compiled against AOSP 16 headers and link AOSP 16's
-  `libhidlbase`, while the vendor impls were built against Android 13's. Calling
-  `IAllocator::allocate` across an `sp<IAllocator>` boundary would put **two
-  copies of the HIDL runtime in one process**. That is the same ABI class of
-  failure as the `android::base::Trim` bug that broke the boot HAL, and it
-  cannot be validated without burning a two-hour build per attempt.
-- The driver's own dependency list proves the *vendor* side is a gralloc4 client
-  (`mapper@4.0` + `libgralloctypes`). Mixing a gralloc1 shim in front of it does
-  not reproduce what the vendor framework does.
+```
+_Z28mali_gralloc_buffer_allocateP19buffer_descriptor_tPP16private_handle_t
+_Z24mali_gralloc_buffer_freeP16private_handle_t
+_Z18allocator_allocatePK19buffer_descriptor_tPP16private_handle_t
+_Z35mali_gralloc_derive_format_and_sizeP19buffer_descriptor_t
+```
 
-### What is shipped instead
+Calling `mali_gralloc_buffer_allocate` is a plain C++ call: no HIDL, no `sp<>`,
+no second runtime. And because the shim is `dlopen`ed *into* `aera_mali`, the
+libc/libc++ it uses are the ones the namespace already resolves, so there is not
+even a libc mismatch to worry about. The handles it returns are MediaTek's own
+`private_handle_t`, i.e. exactly what `hwcomposer.mt6768.so` expects to composite
+as the client target.
 
-The backend is compiled in and stays dormant, which costs nothing at runtime and
-means a future gralloc1 module only needs a property change:
+`device/xiaomi/selene/gralloc1_compat/gralloc1_shim.cpp` implements the nine
+`GRALLOC1_FUNCTION_*` entries the backend asks for on top of those symbols.
 
-- `ro.aera.gpu.*` point at the stock paths. `ro.aera.gpu.gralloc` deliberately
-  names the **absent** `gralloc.mt6768.so`, so `MaliDisplay::Load()` fails,
-  `MaliDisplay::Initialize()` reports a display-HAL failure, and
-  `GpuRenderer::Initialize()` returns false (`gpu_renderer.cpp:121-128`), after
-  which `engine.cpp:293-309` falls back to the software renderer. Do not point it
-  at `gralloc.default.so`.
+#### The descriptor is not ARM's public one
+
+The public `buffer_descriptor_t` does not match this build, so the layout was
+recovered from the vendor binary with `capstone` rather than guessed from a
+header. Disassembling `mali_gralloc_buffer_allocate` (`0xb648`) and
+`mali_gralloc_derive_format_and_size` (`0x9fc0`):
+
+| Offset | Field | Evidence |
+| --- | --- | --- |
+| `+0x04` | `width` | `ldp w10, w11, [x0, #4]`; `str w8, [handle, #0x1c]` |
+| `+0x08` | `height` | same pair; `str w8, [handle, #0x20]` |
+| `+0x10` | `producer_usage` | `ldp x8, x9, [x0, #0x10]` |
+| `+0x18` | `consumer_usage` | same pair; OR'd into one usage |
+| `+0x20` | `hal_format` (u64) | `ldr w0, [x0, #0x20]` |
+| `+0x28` | `layer_count` | read-before-write; `cmp w9, #2` in derive |
+| `+0x34` | `format_type` | `ldr w1, [x19, #0x34]`, passed as `select_format`'s `mali_gralloc_format_type` |
+| `+0x58` | `size` (u64) | derive writes it; `allocator_allocate` reads it as the ION length |
+| `+0x68` | `internal_format` (u64) | `select_format`'s return value |
+| `+0x74` | `byte_stride` | copied to the handle's stride pair |
+| `+0x78` | `pixel_stride` | what `GET_STRIDE` must report |
+
+The highest offset the vendor code touches is `0xac`, so the shim hands over a
+zeroed `0x200`-byte buffer and pokes only these fields. Nothing else about
+`private_handle_t` has to be known, because the vendor fills in its own handle.
+
+Two values cannot be decided from this `.so` alone: `select_format` compares
+`format_type` against `1` and skips usage-bit validation when it is `1` (which
+reads as "hal_format is already internal", i.e. `0` == usage-based), but the
+vendor's descriptor builder lives in a different library; and a fresh gralloc4
+allocation sets `layer_count` to `1` while `0` may also work. Instead of paying a
+two-hour build per guess, the shim probes both at first use, logs every attempt,
+and remembers the winner. `/gpu/gralloc1.conf` pins them without a rebuild:
+
+```
+format_type=0
+layer_count=1
+probe=1
+```
+
+#### What the shim learned on the device
+
+Everything is logged to `/tmp/gralloc1.log` (the shim has no liblog dependency
+on purpose: the namespace shares only libc/libm/libdl, so a `liblog` `DT_NEEDED`
+would have to be staged as well).
+
+### Live debugging: the driver now loads, and two new facts
+
+Getting from `EGL driver loading failed` to `Mali: display HAL loading failed`
+took two findings that are worth keeping:
+
+1. **A staged `libdl_android.so` shadows the process copy.** The namespace error
+   was `dlopen failed: library "ld-android.so" not found: needed by
+   /gpu/stock-vendor/lib64/libdl_android.so in namespace aera_mali`, because
+   `libvndksupport`/`libapexsupport` need `libdl_android`, which in turn needs
+   `ld-android.so`, and only libc/libm/libdl are shared with the process. The
+   workaround in use is to retag `ld-android.so` from `DT_NEEDED` to `DT_DEBUG`
+   in the blob-store copy. **The proper fix** is to add `libdl_android.so` to the
+   namespace link list in `mali_display.cpp` (`link(ns, nullptr,
+   "libc.so:libm.so:libdl.so:libdl_android.so")`) so the process copy is used and
+   no patched stub is needed. Until then, do not remove the patch without also
+   changing that line.
+2. **The driver's remaining dependencies are all resolvable.** With
+   `libdl_android` fixed, `libGLES_mali.so` loads and the error advances to
+   `Mali: display HAL loading failed`, i.e. `Initialize()` — which is the
+   gralloc1 path.
+
+`hwcomposer.mt6768.so` needs 24 libraries that are not in the 60-library staging
+set (the `vendor.mediatek.hardware.pq@2.1`…`@2.15` family, `libhidltransport`,
+`libhwbinder`, `libxml2`, `libprocessgroup*`, `libmml`, `libpower`,
+`libpqparamparser`, `libcomposer_ext`, `composer_ext@1.0`, `libdrm`, …), all of
+which exist on the real vendor partition. They are 29 files / 5 MiB and were
+copied into the blob store, then parked in `/gpu-rescue/hold29` again because of
+the next point. The two gralloc4 impls need only `libdrm.so` on top of what is
+already staged.
+
+**Open issue: the Android 12 destructor aborts under Android 16's allocator.**
+Once `hwcomposer` loads, the failure path calls `~Impl()`, which `dlclose`s it,
+and MTK's Android 12 destructor frees a pointer whose top-byte tag Android 16's
+bionic rejects:
+
+```
+F/libc: Pointer tag for 0x... was truncated, see '.../tagged-pointers'
+F/libc: Fatal signal 6 (SIGABRT) ... pid (recovery)
+```
+
+That is a recovery crash loop, not a GPU failure. It is not caused by mounting
+`/vendor` (unmounting did not stop it). The likely fixes are
+`mallopt(M_BIONIC_SET_HEAP_TAGGING_LEVEL, M_HEAP_TAGGING_LEVEL_NONE)` in the
+loader, or not `dlclose`ing a HAL that failed to initialize — both are in
+`mali_display.cpp`, which this repo controls. With the gralloc1 shim present,
+`Initialize()` should no longer reach that path at all, so this may resolve
+itself; if it does not, that is the next thing to fix.
+
+
+### What is shipped
+
+The backend is compiled in, and `gralloc.mt6768.so` is now provided by this repo
+(`libaera_gralloc1`) instead of being absent:
+
+- `ro.aera.gpu.*` point at the stock paths. `ro.aera.gpu.gralloc` names
+  `gralloc.mt6768.so` — the shim — which CI publishes as a release asset and which
+  is staged from the blob store like the other vendor libraries. If the shim is
+  missing, `MaliDisplay::Load()` fails, `Initialize()` reports a display-HAL
+  failure, and `GpuRenderer::Initialize()` returns false
+  (`gpu_renderer.cpp:121-128`), after which `engine.cpp:293-309` falls back to the
+  software renderer — i.e. the old behaviour, so a missing shim degrades instead
+  of breaking. Do not point it at `gralloc.default.so`: that is the AOSP fbdev
+  gralloc0 module and `gralloc1_open()` hands back a mismatched function table.
 - `selene-gpu-launch.sh` is the best-effort `on boot` stager. The by-name nodes
   **do** exist on this device — `/dev/block/by-name/vendor -> /dev/block/dm-5`,
   `system -> dm-2`, `super -> mmcblk0p52` — and `mount -o ro
@@ -528,18 +635,43 @@ means a future gralloc1 module only needs a property change:
   `android_link_namespaces` are still exported by Android 16's
   `libdl_android.so` (`bionic/libdl/libdl_android.cpp`).
 
-**Bottom line: do not expect `Mali HWC2 GPU ready` on selene with the current
-backend.** The UI stays on the software renderer at ~4 fps. The blocker is one
-missing HAL, not a driver problem, and there are exactly two ways it clears:
+**Bottom line: the missing HAL is no longer missing.** The blocker was always one
+thing — the backend wants a gralloc1 module and this vendor ships gralloc4 — and
+this repo now supplies one. The driver loads, `libGLES_mali.so` resolves every
+dependency, and the only thing left is whether the shim's descriptor matches what
+MediaTek's allocator expects, which is a config file, not a rebuild.
 
-1. **apkreader adds a gralloc4 path** to `mali_display.cpp` — allocate through
+There are two paths, and they are no longer mutually exclusive:
+
+1. **The gralloc1 shim (this repo).** `libaera_gralloc1` implements the nine
+   `GRALLOC1_FUNCTION_*` entries the backend calls on top of MediaTek's exported
+   `mali_gralloc_buffer_allocate`/`_free`. Published by CI as
+   `gralloc.mt6768.so`, which is already the path in `ro.aera.gpu.gralloc`, and
+   staged from the blob store like the other vendor libraries. Two descriptor
+   values (`format_type`, `layer_count`) are probed at runtime and can be pinned
+   in `/gpu/gralloc1.conf` without rebuilding.
+2. **apkreader adds a gralloc4 path** to `mali_display.cpp` — allocate through
    HIDL `allocator@4.0` and describe/lock through `mapper@4.0`, which is what the
-   stock framework does. This is the correct fix and needs no shim. The
-   workflow already tracks his `mali-testing` branch head, so it lands with no
-   change on this side.
-2. **A gralloc1 module appears** — it will not, on this vendor image.
+   stock framework does. If he lands it, prefer it: it is the vendor's own
+   contract and needs no descriptor guessing. The workflow already tracks his
+   `mali-testing` branch head, so it lands with no change on this side.
 
-A gralloc1 shim over the HIDL impls stays rejected for the reason above.
+What is still open is *not* the shim's existence:
+
+- **Pointer-tag abort.** MTK's Android 12 `hwcomposer` destructor frees a tagged
+  pointer that Android 16's bionic rejects, so a *failed* `Initialize()` becomes
+  a SIGABRT crash loop. A successful `Initialize()` should not reach it. If it
+  does, the fix is `mallopt(M_BIONIC_SET_HEAP_TAGGING_LEVEL,
+  M_HEAP_TAGGING_LEVEL_NONE)` and/or not `dlclose`ing a failed HAL, both in
+  `mali_display.cpp`.
+- **UK version skew.** Userspace is r32p1 (UK 11.31), the dieD kernel reports UK
+  11.46. `uku_open` is only reached at `eglInitialize`, i.e. after
+  `MaliDisplay::Initialize()` succeeds, so this has never actually been tested
+  yet. It is the next unknown in line, not a known failure.
+- **The 29 extra libraries.** `hwcomposer.mt6768.so` needs 29 files / 5 MiB that
+  are not in the 60-library staging set. They are parked in
+  `/gpu-rescue/hold29` and have to be copied back into the blob store before the
+  shim can be exercised end to end.
 
 ## What is pushed / what is pending
 
@@ -575,13 +707,11 @@ tree: `aeraui/patches/lvgl/` holds exactly the four patches the helper requires
 `prepare-mali-lvgl.py` resolves `--lvgl` to `<tree>/external/lvgl` from
 `bootable/recovery/aeraui/tools/`, which is where the manifest puts it.
 
-Pending: **flash run #7 and confirm it regresses nothing.** It is the first image
-that contains the Mali integration at all — every earlier image predates it — so
-it is also the baseline to compare against once a gralloc4 path exists. A green
-run means every `::error::` guard passed: the shim built and exported
-`android::base::Trim`, it was staged at `/sbin`, the boot HAL `.rc` sets
-`LD_PRELOAD`, the manifest declares `@1.2`, and all three GPU scripts are staged
-executable.
+**Current state: run #7 is flashed and boots.** It is the baseline that proves the
+Mali integration is inert rather than harmful. Run #8 (`f8c7e110`) adds the
+gralloc1 shim on top and publishes it as `gralloc.mt6768.so`; what remains is
+copying it and the 29 parked libraries into the blob store and iterating on
+`/gpu/gralloc1.conf` on the device.
 
 Run #7 measured, for future reference: 148 min wall, of which `Cleanup` 4.4,
 `Restore source cache` 3.8, `Sync AERA sources` 6.2, and `Build` 133.1. The
@@ -614,12 +744,14 @@ Run #7 measured, for future reference: 148 min wall, of which `Cleanup` 4.4,
 3. Confirm the preload regression is gone: flash any zip and check that the
    installer's `getprop`/`sh` do **not** die with
    `CANNOT LINK EXECUTABLE ... libaera_boot_trim.so not found`.
-4. Confirm the Mali integration is at least inert, not harmful:
-   - `getprop ro.aera.gpu.gralloc` -> `gralloc.mt6768.so` (absent on purpose)
-   - `logcat -d -b all -s AeraGpu` -> the backend reports the failed load, and
-     the UI is still the software renderer (~4 fps). `Mali HWC2 GPU ready` here
-     would mean a gralloc1 provider appeared out of nowhere; treat it as a
-     surprise, not a win.
+4. Exercise the GPU path:
+   - `getprop ro.aera.gpu.gralloc` -> `gralloc.mt6768.so` (the shim; absent from
+     the ramdisk on purpose, it is staged from the blob store).
+   - `logcat -d -b all -v time -s AeraGpu | tail -1` after
+     `setprop ctl.restart recovery` (~17-22 s) is the fast loop — no flash needed.
+     `Mali HWC2 GPU ready` means the shim worked.
+   - `cat /tmp/gralloc1.log` shows every descriptor probe attempt; pin the winner
+     in `/gpu/gralloc1.conf` (`format_type`, `layer_count`, `probe`).
    - `ls -l /system/bin/selene-gpu-*.sh` -> all three present and executable.
 5. If a backup fails with `EIO`, check `/proc/partitions` for `mmcblk1` before
    blaming the card — a removed card leaves a stale mount that EIOs forever

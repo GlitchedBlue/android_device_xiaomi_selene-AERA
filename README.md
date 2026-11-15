@@ -31,7 +31,7 @@ This tree **builds, boots and works**. It is a bring-up port, not a release.
 | Boot / UI / touch | **Works** |
 | FBE decryption | **Works** (run #4 + the VINTF fix) |
 | Backup / restore / zip install | **Works** |
-| GPU acceleration | **Blocked** — the vendor has no gralloc1 module |
+| GPU acceleration | **In progress** — the vendor ships gralloc4, so this tree supplies a gralloc1 shim |
 
 ### Verified on the device
 
@@ -52,11 +52,15 @@ This tree **builds, boots and works**. It is a bring-up port, not a release.
   1080×2400, which is ~1.8× more pixels than the screen has.
 - **No MTP.** The kernel is built without `CONFIG_USB_CONFIGFS_F_MTP`. Use
   *Mount → USB Storage* instead.
-- **No GPU.** selene's Android 13 vendor ships gralloc4 (HIDL
-  `allocator@4.0` + `mapper@4.0`) and **no gralloc1 module**, while the Mali
-  backend needs `gralloc1_open()`. The backend is compiled in and stays
-  dormant; the UI falls back to software. This is true of the stock firmware
-  too, not just of a modified vendor.
+- **GPU acceleration is in progress.** selene's Android 13 vendor ships gralloc4
+  (HIDL `allocator@4.0` + `mapper@4.0`) and **no gralloc1 module**, while the Mali
+  backend calls `gralloc1_open()`. `device/xiaomi/selene/gralloc1_compat/` now
+  builds `gralloc.mt6768.so`, a gralloc1 shim over MediaTek's exported
+  `mali_gralloc_buffer_allocate`/`_free`, which CI publishes as a release asset
+  and which is staged from the blob store like the other vendor libraries. The
+  driver loads (`libGLES_mali.so` resolves every dependency) and the remaining
+  work is validating the shim's buffer descriptor on the device — see
+  `HANDOFF.md`. Until it initialises, the UI falls back to software rendering.
 - **`aera backup --parts` needs TWRP-style mount points**: `--parts boot` fails
   silently, `--parts /boot` works. The GUI is unaffected.
 
