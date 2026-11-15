@@ -105,9 +105,11 @@ int RunHwcProbe(const char* path) {
     printf("hwcomposer open failed\n");
     return 1;
   }
-  printf("version : %#x (HWC2: %s)\n", device->common.version,
-         (device->common.version >> 24) == 2 ? "yes" : "NO");
-  printf("close   : %d\n", device->common.close(device));
+  // hw_device_t *is* the common part: tag/version/module/close are its own
+  // members, there is no nested `common`.
+  printf("version : %#x (HWC2: %s)\n", device->version,
+         (device->version >> 24) == 2 ? "yes" : "NO");
+  printf("close   : %d\n", device->close(device));
   printf("dlclose : %d\n", dlclose(library));
   printf("survived the destructor path\n");
   return 0;
