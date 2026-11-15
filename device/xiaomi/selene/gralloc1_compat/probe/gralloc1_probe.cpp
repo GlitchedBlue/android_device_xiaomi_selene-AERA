@@ -48,7 +48,9 @@
 // libion, libdrm, ...) have to resolve to the vendor copies.
 
 #include <dlfcn.h>
+#include <errno.h>
 #include <malloc.h>
+#include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -441,7 +443,7 @@ int RunLifecycleProbe(const char* path, bool teardown) {
 // fail on its own, and each failure otherwise costs a two-and-a-half-hour image
 // build to discover.
 bool AllocateScanout(const char* shim_path, uint32_t width, uint32_t height,
-                     buffer_handle_t* out, gralloc1_device_t** out_device) {
+                     buffer_handle_t* out, int count, gralloc1_device_t** out_device) {
   void* library = dlopen(shim_path, RTLD_NOW);
   if (library == nullptr) {
     printf("shim    : dlopen failed: %s\n", dlerror());
@@ -491,14 +493,19 @@ bool AllocateScanout(const char* shim_path, uint32_t width, uint32_t height,
     DESTROY_DESCRIPTOR(device, descriptor);
     return false;
   }
-  const int rc = ALLOCATE(device, 1, &descriptor, out);
-  uint32_t stride = 0;
-  if (rc == GRALLOC1_ERROR_NONE && *out != nullptr) GET_STRIDE(device, *out, &stride);
+  bool ok = true;
+  for (int i = 0; i < count; ++i) {
+    out[i] = nullptr;
+    const int rc = ALLOCATE(device, 1, &descriptor, &out[i]);
+    uint32_t stride = 0;
+    if (rc == GRALLOC1_ERROR_NONE && out[i] != nullptr) GET_STRIDE(device, out[i], &stride);
+    printf("shim    : allocate %d -> %d handle=%p stride=%u\n", i, rc,
+           static_cast<const void*>(out[i]), stride);
+    ok = ok && rc == GRALLOC1_ERROR_NONE && out[i] != nullptr;
+  }
   DESTROY_DESCRIPTOR(device, descriptor);
-  printf("shim    : allocate -> %d handle=%p stride=%u\n", rc, static_cast<const void*>(*out),
-         stride);
   *out_device = device;
-  return rc == GRALLOC1_ERROR_NONE && *out != nullptr;
+  return ok;
 }
 
 int RunPresentProbe(const char* hwc_path, const char* shim_path, uint32_t width,
@@ -592,24 +599,43 @@ int RunPresentProbe(const char* hwc_path, const char* shim_path, uint32_t width,
   printf("layer   : alpha -> %d\n",
          SET_LAYER_PLANE_ALPHA(device, display, layer, 1.0f));
 
-  buffer_handle_t buffer = nullptr;
+  // Two buffers and three frames, which is the shape the renderer actually
+  // uses: present, wait for the release fence, present the other buffer, ...
+  // A composer that only survives the first frame would still look fine in a
+  // one-shot test.
+  buffer_handle_t buffers[2] = {nullptr, nullptr};
   gralloc1_device_t* allocator = nullptr;
-  if (!AllocateScanout(shim_path, width, height, &buffer, &allocator)) return 1;
+  if (!AllocateScanout(shim_path, width, height, buffers, 2, &allocator)) return 1;
 
   const hwc_region_t damage{1, &frame};
-  const int target_rc = SET_CLIENT_TARGET(device, display, buffer, -1, 0, damage);
-  printf("target  : %d\n", target_rc);
-
-  uint32_t types = 0, requests = 0;
-  int result = VALIDATE_DISPLAY(device, display, &types, &requests);
-  printf("validate: %d types=%u requests=%u\n", result, types, requests);
-  if (result == HWC2_ERROR_HAS_CHANGES) {
-    result = ACCEPT_DISPLAY_CHANGES(device, display);
-    printf("accept  : %d\n", result);
+  int previous_fence = -1;
+  int failures = 0;
+  for (int i = 0; i < 3; ++i) {
+    if (previous_fence >= 0) {
+      pollfd pending{previous_fence, POLLIN, 0};
+      int polled;
+      do { polled = poll(&pending, 1, 1000); } while (polled < 0 && errno == EINTR);
+      printf("frame %d : waited for the previous release fence -> %d revents=%#x\n",
+             i, polled, pending.revents);
+      close(previous_fence);
+      previous_fence = -1;
+    }
+    const int target_rc = SET_CLIENT_TARGET(device, display, buffers[i % 2], -1, 0, damage);
+    uint32_t types = 0, requests = 0;
+    int result = VALIDATE_DISPLAY(device, display, &types, &requests);
+    printf("frame %d : target=%d validate=%d types=%u requests=%u\n", i, target_rc, result,
+           types, requests);
+    if (result == HWC2_ERROR_HAS_CHANGES) {
+      result = ACCEPT_DISPLAY_CHANGES(device, display);
+      printf("frame %d : accept=%d\n", i, result);
+    }
+    int fence = -1;
+    const int present_rc = PRESENT_DISPLAY(device, display, &fence);
+    printf("frame %d : present=%d fence=%d\n", i, present_rc, fence);
+    if (target_rc || result || present_rc) ++failures;
+    previous_fence = fence;
   }
-  int fence = -1;
-  const int present_rc = PRESENT_DISPLAY(device, display, &fence);
-  printf("present : %d fence=%d\n", present_rc, fence);
+  if (previous_fence >= 0) close(previous_fence);
 
   uint32_t fence_count = 0;
   const int fences_rc = GET_RELEASE_FENCES(device, display, &fence_count, nullptr, nullptr);
@@ -625,10 +651,9 @@ int RunPresentProbe(const char* hwc_path, const char* shim_path, uint32_t width,
       if (fds[i] >= 0) close(fds[i]);
     }
   }
-  if (fence >= 0) close(fence);
 
   printf("teardown: skipped (deliberately; the composer is never unloaded)\n");
-  return present_rc == 0 ? 0 : 1;
+  return failures == 0 ? 0 : 1;
 }
 
 }  // namespace
