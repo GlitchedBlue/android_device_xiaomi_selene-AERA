@@ -575,8 +575,17 @@ tree: `aeraui/patches/lvgl/` holds exactly the four patches the helper requires
 `prepare-mali-lvgl.py` resolves `--lvgl` to `<tree>/external/lvgl` from
 `bootable/recovery/aeraui/tools/`, which is where the manifest puts it.
 
-Pending: **the build itself.** Run #7 is the first image that contains the Mali
-integration at all — every earlier image predates it.
+Pending: **flash run #7 and confirm it regresses nothing.** It is the first image
+that contains the Mali integration at all — every earlier image predates it — so
+it is also the baseline to compare against once a gralloc4 path exists. A green
+run means every `::error::` guard passed: the shim built and exported
+`android::base::Trim`, it was staged at `/sbin`, the boot HAL `.rc` sets
+`LD_PRELOAD`, the manifest declares `@1.2`, and all three GPU scripts are staged
+executable.
+
+Run #7 measured, for future reference: 148 min wall, of which `Cleanup` 4.4,
+`Restore source cache` 3.8, `Sync AERA sources` 6.2, and `Build` 133.1. The
+`.repo` cache is doing its job — a cold sync alone used to be ~20 min.
 
 ## Run history
 
@@ -588,7 +597,7 @@ integration at all — every earlier image predates it.
 | #4 `43566176237` | **success** | decryption PIN screen (after live manifest patch) | shim fixed `dlopen`; VINTF refusal on boot@1.2 remained — manifest fix unpushed |
 | #5 `43586256262` | cancelled | — | superseded before the manifest-only image was built; the scoped-preload fix went in instead |
 | #6 `43629463339` | cancelled | — | Mali integration commit; cancelled on request to free the runner for OrangeFox testing |
-| #7 `43635914131` | running | — | first image with the Mali backend compiled in (dormant: no gralloc1) |
+| #7 `43635914131` | **success**, 148 min | image published | first image with the Mali backend compiled in (dormant: no gralloc1); every assertion passed |
 
 ## Next time you sit down
 
