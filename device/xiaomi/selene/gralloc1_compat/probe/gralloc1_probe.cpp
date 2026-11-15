@@ -53,12 +53,15 @@
 #include <android/dlext.h>
 #include <dlfcn.h>
 #include <errno.h>
+#include <execinfo.h>
 #include <malloc.h>
 #include <poll.h>
+#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ucontext.h>
 #include <unistd.h>
 
 #include <EGL/egl.h>
@@ -669,6 +672,50 @@ int RunPresentProbe(const char* hwc_path, const char* shim_path, uint32_t width,
   return failures == 0 ? 0 : 1;
 }
 
+// A crashing vendor driver is the normal outcome of some of these experiments,
+// and recovery has no tombstoned/crash_dump, so a SIGSEGV otherwise says nothing
+// but "Segmentation fault". This handler prints the faulting address and a
+// backtrace resolved to library+offset, which is enough to find the code in the
+// blob with a disassembler.
+void CrashHandler(int signal, siginfo_t* info, void* context) {
+  char line[512];
+  void* frames[40];
+  const int count = backtrace(frames, 40);
+  uintptr_t pc = 0;
+  if (context != nullptr) {
+    auto* uc = static_cast<ucontext_t*>(context);
+    pc = static_cast<uintptr_t>(uc->uc_mcontext.pc);
+  }
+  int length = snprintf(line, sizeof(line),
+                        "\ncrash   : signal %d addr=%p pc=%#lx frames=%d\n", signal,
+                        info != nullptr ? info->si_addr : nullptr,
+                        static_cast<unsigned long>(pc), count);
+  if (length > 0) write(2, line, static_cast<size_t>(length));
+  for (int i = 0; i < count; ++i) {
+    Dl_info dl{};
+    const char* name = "?";
+    unsigned long offset = 0;
+    if (dladdr(frames[i], &dl) != 0 && dl.dli_fname != nullptr) {
+      name = dl.dli_fname;
+      offset = static_cast<unsigned long>(reinterpret_cast<uintptr_t>(frames[i]) -
+                                          reinterpret_cast<uintptr_t>(dl.dli_fbase));
+    }
+    length = snprintf(line, sizeof(line), "  #%02d %p %s+%#lx\n", i, frames[i], name,
+                      offset);
+    if (length > 0) write(2, line, static_cast<size_t>(length));
+  }
+  _exit(128 + signal);
+}
+
+void InstallCrashHandler() {
+  struct sigaction action {};
+  action.sa_sigaction = CrashHandler;
+  action.sa_flags = SA_SIGINFO | SA_ONSTACK;
+  sigaction(SIGSEGV, &action, nullptr);
+  sigaction(SIGBUS, &action, nullptr);
+  sigaction(SIGABRT, &action, nullptr);
+}
+
 // ---------------------------------------------------------------------------
 // --egl: the EGL half of GpuRenderer::Initialize()
 // ---------------------------------------------------------------------------
@@ -1028,6 +1075,7 @@ int main(int argc, char** argv) {
   // printf loses the last few lines and with them the answer to "how far did it
   // get".
   setvbuf(stdout, nullptr, _IONBF, 0);
+  InstallCrashHandler();
 
   // The vendor's Android 12 destructor frees a pointer whose top-byte heap tag
   // Android 16's bionic refuses to accept ("Pointer tag for ... was truncated"),
