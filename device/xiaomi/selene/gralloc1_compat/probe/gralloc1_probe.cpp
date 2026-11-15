@@ -25,8 +25,13 @@
 //   LD_LIBRARY_PATH=/gpu/lib64:/vendor/lib64:/system/lib64 \
 //     /data/local/tmp/gralloc1-probe --hwc [hwcomposer.mt6768.so]
 //
+//   LD_LIBRARY_PATH=/gpu/lib64:/vendor/lib64:/system/lib64 \
+//     /data/local/tmp/gralloc1-probe --hotplug [hwcomposer.mt6768.so]
+//
 // The second form is the crash-loop test: it opens and closes the vendor HWC2
-// module without recovery being involved.
+// module without recovery being involved. The third registers the hotplug
+// callback, waits for it, and asks the composer about displays 0..3, which is
+// what settles why mali_display.cpp reports "primary display discovery failed".
 //
 // LD_LIBRARY_PATH must contain the staged Android 12 libraries, because the
 // shim dlopens the vendor allocator impl, whose own DT_NEEDED (libhidlbase,
@@ -37,9 +42,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #include <hardware/gralloc1.h>
 #include <hardware/hardware.h>
+#include <hardware/hwcomposer2.h>
 
 namespace {
 
@@ -116,6 +123,115 @@ int RunHwcProbe(const char* path) {
   return 0;
 }
 
+// ---------------------------------------------------------------------------
+// --hotplug: the question mali_display.cpp gets wrong on this vendor stack
+// ---------------------------------------------------------------------------
+// Initialize() registers the HWC2 hotplug callback and then immediately checks
+// whether anything is connected:
+//
+//   register_callback(composer, HWC2_CALLBACK_HOTPLUG, &state, Hotplug);
+//   if (!state.connected.load()) return Fail("primary display discovery");
+//
+// On selene that check fails every time, which leaves three possibilities, and
+// they need different fixes:
+//
+//   * MTK delivers the callback synchronously from register_callback() -- then
+//     the check would pass, so it is not this;
+//   * MTK delivers it later, from its own worker thread -- then the fix is to
+//     wait for it instead of failing on the first look;
+//   * MTK never delivers it until something asks about the display (a "first
+//     commit"-style composer) -- then the fix is to query the display directly.
+//
+// One run answers all three: register, poll for a few seconds, and meanwhile ask
+// getDisplayConfigs() about display ids 0..3, which is what a client that does
+// not trust hotplug would do. It then tears down exactly like ~Impl()
+// (unregister, close, dlclose), because that is the other half of the crash:
+// recovery aborts on a *worker* thread, i.e. while the vendor module is being
+// unloaded underneath it.
+volatile int g_hotplug_count = 0;
+volatile int g_hotplug_connected = 0;
+volatile unsigned long long g_hotplug_display = ~0ull;
+
+void HotplugCallback(hwc2_callback_data_t, hwc2_display_t display, int32_t state) {
+  __atomic_add_fetch(&g_hotplug_count, 1, __ATOMIC_SEQ_CST);
+  __atomic_store_n(&g_hotplug_display, static_cast<unsigned long long>(display),
+                   __ATOMIC_SEQ_CST);
+  __atomic_store_n(&g_hotplug_connected, state == HWC2_CONNECTION_CONNECTED ? 1 : 0,
+                   __ATOMIC_SEQ_CST);
+  printf("hotplug : display=%llu state=%d tid=%d\n",
+         static_cast<unsigned long long>(display), static_cast<int>(state),
+         static_cast<int>(gettid()));
+}
+
+int RunHotplugProbe(const char* path) {
+  printf("hwc     : %s\n", path);
+  void* library = dlopen(path, RTLD_NOW);
+  if (library == nullptr) {
+    printf("dlopen  : %s\n", dlerror());
+    return 1;
+  }
+  auto* module = static_cast<hw_module_t*>(dlsym(library, HAL_MODULE_INFO_SYM_AS_STR));
+  if (module == nullptr || module->methods == nullptr || module->methods->open == nullptr) {
+    printf("dlsym/open: %s\n", module == nullptr ? dlerror() : "no methods->open");
+    return 1;
+  }
+  hw_device_t* base = nullptr;
+  if (module->methods->open(module, "composer", &base) != 0 || base == nullptr) {
+    printf("hwcomposer open failed\n");
+    return 1;
+  }
+  auto* device = reinterpret_cast<hwc2_device_t*>(base);
+  printf("version : %#x (HWC2: %s)\n", device->common.version,
+         (device->common.version >> 24) == 2 ? "yes" : "NO");
+
+  auto reg = reinterpret_cast<HWC2_PFN_REGISTER_CALLBACK>(
+      device->getFunction(device, HWC2_FUNCTION_REGISTER_CALLBACK));
+  auto configs = reinterpret_cast<HWC2_PFN_GET_DISPLAY_CONFIGS>(
+      device->getFunction(device, HWC2_FUNCTION_GET_DISPLAY_CONFIGS));
+  printf("lookup  : register_callback=%p get_display_configs=%p\n",
+         reinterpret_cast<void*>(reg), reinterpret_cast<void*>(configs));
+  if (reg == nullptr) {
+    printf("no register_callback\n");
+    return 1;
+  }
+
+  // Exactly what Initialize() does, on the caller's thread.
+  const int rc = reg(device, HWC2_CALLBACK_HOTPLUG, nullptr,
+                     reinterpret_cast<hwc2_function_pointer_t>(HotplugCallback));
+  printf("register: %d connected_right_after=%d callbacks=%d\n", rc,
+         __atomic_load_n(&g_hotplug_connected, __ATOMIC_SEQ_CST),
+         __atomic_load_n(&g_hotplug_count, __ATOMIC_SEQ_CST));
+
+  // Poll for up to five seconds, printing the first time the state changes.
+  int waited_ms = 0;
+  while (waited_ms < 5000 && !__atomic_load_n(&g_hotplug_connected, __ATOMIC_SEQ_CST)) {
+    usleep(100000);
+    waited_ms += 100;
+  }
+  printf("waited  : %d ms connected=%d callbacks=%d display=%llu\n", waited_ms,
+         __atomic_load_n(&g_hotplug_connected, __ATOMIC_SEQ_CST),
+         __atomic_load_n(&g_hotplug_count, __ATOMIC_SEQ_CST),
+         __atomic_load_n(&g_hotplug_display, __ATOMIC_SEQ_CST));
+
+  // Whether the display is reachable without hotplug at all.
+  if (configs != nullptr) {
+    for (uint64_t id = 0; id < 4; ++id) {
+      uint32_t count = 0;
+      const int config_rc = configs(device, id, &count, nullptr);
+      printf("configs : display=%llu -> %d, %u config(s)\n",
+             static_cast<unsigned long long>(id), config_rc, count);
+    }
+  }
+
+  // ~Impl(): unregister, close, dlclose. If a worker thread is still inside the
+  // module when the last dlclose runs, this is where recovery dies.
+  printf("unreg   : %d\n", reg(device, HWC2_CALLBACK_HOTPLUG, nullptr, nullptr));
+  printf("close   : %d\n", device->common.close(&device->common));
+  printf("dlclose : %d\n", dlclose(library));
+  printf("survived the teardown\n");
+  return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -152,6 +268,14 @@ int main(int argc, char** argv) {
       if (strncmp(argv[i], "--", 2) != 0) hwc_path = argv[i];
     }
     return RunHwcProbe(hwc_path);
+  }
+
+  if (argc > 1 && strcmp(argv[1], "--hotplug") == 0) {
+    const char* hwc_path = "/gpu/stock-vendor/lib64/hw/hwcomposer.mt6768.so";
+    for (int i = 2; i < argc; ++i) {
+      if (strncmp(argv[i], "--", 2) != 0) hwc_path = argv[i];
+    }
+    return RunHotplugProbe(hwc_path);
   }
 
   const char* path = argc > 1 ? argv[1]
