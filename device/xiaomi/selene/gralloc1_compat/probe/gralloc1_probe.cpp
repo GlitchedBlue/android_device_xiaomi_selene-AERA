@@ -948,11 +948,19 @@ int RunEglProbe(const char* driver_path, const char* shim_path, uint32_t width,
   GLuint textures[2] = {};
   GLuint framebuffers[2] = {};
   EGLImageKHR images[2] = {EGL_NO_IMAGE_KHR, EGL_NO_IMAGE_KHR};
+  bool complete[2] = {false, false};
   gl_gen_textures(2, textures);
   gl_gen_framebuffers(2, framebuffers);
   int failures = 0;
   for (int i = 0; i < 2; ++i) {
     ProbeWindowBuffer window{};
+    // AOSP's GraphicBuffer sets these two; mali_display.cpp does not. Buffer 0
+    // gets them and buffer 1 does not, so one run says whether Mali validates
+    // them (EGL_BAD_PARAMETER if so).
+    if (i == 0) {
+      window.common.magic = 0x5f626672;  // ANDROID_NATIVE_BUFFER_MAGIC ('_bfr')
+      window.common.version = sizeof(ProbeWindowBuffer);
+    }
     window.common.incRef = ProbeReference;
     window.common.decRef = ProbeReference;
     window.width = static_cast<int>(width);
@@ -963,6 +971,9 @@ int RunEglProbe(const char* driver_path, const char* shim_path, uint32_t width,
     window.handle = buffers[i];
     window.usage = kProbeNativeUsage;
     window.usage_deprecated = static_cast<int>(window.usage);
+    printf("image %d : magic %#x version %zu handle fds=%d ints=%d fd0=%d\n", i,
+           window.common.magic, static_cast<size_t>(window.common.version),
+           buffers[i]->numFds, buffers[i]->numInts, buffers[i]->data[0]);
 
     const EGLint image_attributes[] = {EGL_IMAGE_PRESERVED_KHR, EGL_TRUE, EGL_NONE};
     images[i] = create_image(display, EGL_NO_CONTEXT, EGL_NATIVE_BUFFER_ANDROID,
@@ -987,10 +998,13 @@ int RunEglProbe(const char* driver_path, const char* shim_path, uint32_t width,
     const GLenum status = gl_check_framebuffer_status(GL_FRAMEBUFFER);
     printf("image %d : framebuffer %#x%s\n", i, status,
            status == GL_FRAMEBUFFER_COMPLETE ? " (complete)" : " (INCOMPLETE)");
-    if (status != GL_FRAMEBUFFER_COMPLETE) ++failures;
+    complete[i] = status == GL_FRAMEBUFFER_COMPLETE;
+    if (!complete[i]) ++failures;
   }
 
-  if (failures == 0) {
+  // The render check only needs one working image; the A/B above is allowed to
+  // fail one of them on purpose.
+  if (complete[0]) {
     gl_bind_framebuffer(GL_FRAMEBUFFER, framebuffers[0]);
     gl_viewport(0, 0, static_cast<GLsizei>(width), static_cast<GLsizei>(height));
     gl_clear_color(0.0f, 1.0f, 0.0f, 1.0f);
