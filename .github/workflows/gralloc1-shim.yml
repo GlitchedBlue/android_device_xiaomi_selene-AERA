@@ -82,6 +82,27 @@ jobs:
           ls -l artifacts/gralloc.mt6768.so
           sha256sum artifacts/gralloc.mt6768.so
 
+      # The probe is what actually makes this job useful: it exercises the shim
+      # without hwcomposer, so a descriptor change can be tested with one adb
+      # command instead of a recovery restart (and a restart is where the A12
+      # destructor / A16 heap-tag abort lives).
+      - name: Compile the standalone probe
+        env:
+          NDK: ${{ steps.ndk.outputs.ndk }}
+        run: |
+          set -eu
+          CXX="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/clang++"
+          "$CXX" \
+            --target=aarch64-linux-android31 \
+            -std=gnu++17 -fPIE -pie \
+            -nostdlib++ -fno-exceptions -fno-rtti \
+            -Wall -Wextra -fvisibility=default \
+            -I shim-headers \
+            -o artifacts/gralloc1-probe \
+            device/xiaomi/selene/gralloc1_compat/probe/gralloc1_probe.cpp
+          ls -l artifacts/gralloc1-probe
+          file artifacts/gralloc1-probe || true
+
       # Same three properties the image build asserts with Soong, because they
       # are what make the module loadable inside aera_mali: the namespace shares
       # exactly libc/libm/libdl with the recovery process, so any other
@@ -113,5 +134,5 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: gralloc1-shim
-          path: artifacts/gralloc.mt6768.so
+          path: artifacts/
           if-no-files-found: error
