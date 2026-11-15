@@ -33,6 +33,7 @@
 // libion, libdrm, ...) have to resolve to the vendor copies.
 
 #include <dlfcn.h>
+#include <malloc.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -118,6 +119,33 @@ int RunHwcProbe(const char* path) {
 }  // namespace
 
 int main(int argc, char** argv) {
+  // Unbuffered, because the interesting failures abort the process: a buffered
+  // printf loses the last few lines and with them the answer to "how far did it
+  // get".
+  setvbuf(stdout, nullptr, _IONBF, 0);
+
+  // The vendor's Android 12 destructor frees a pointer whose top-byte heap tag
+  // Android 16's bionic refuses to accept ("Pointer tag for ... was truncated"),
+  // which is a SIGABRT in a recovery process. Disabling heap tagging for this
+  // process is the documented escape hatch and the only lever available without
+  // patching the vendor binary. --keep-tags runs without it, to compare.
+  bool keep_tags = false;
+  for (int i = 1; i < argc; ++i) {
+    if (strcmp(argv[i], "--keep-tags") == 0) keep_tags = true;
+  }
+#if defined(__BIONIC__) && defined(M_BIONIC_SET_HEAP_TAGGING_LEVEL) && \
+    defined(M_HEAP_TAGGING_LEVEL_NONE)
+  if (!keep_tags) {
+    const int rc = mallopt(M_BIONIC_SET_HEAP_TAGGING_LEVEL, M_HEAP_TAGGING_LEVEL_NONE);
+    printf("tagging : heap tagging off (mallopt -> %d)\n", rc);
+  } else {
+    printf("tagging : heap tagging left on (--keep-tags)\n");
+  }
+#else
+  (void)keep_tags;
+  printf("tagging : no mallopt heap-tagging constants at build time\n");
+#endif
+
   if (argc > 1 && strcmp(argv[1], "--hwc") == 0) {
     return RunHwcProbe(argc > 2 ? argv[2]
                                 : "/gpu/stock-vendor/lib64/hw/hwcomposer.mt6768.so");
