@@ -28,10 +28,17 @@
 //   LD_LIBRARY_PATH=/gpu/lib64:/vendor/lib64:/system/lib64 \
 //     /data/local/tmp/gralloc1-probe --hotplug [hwcomposer.mt6768.so]
 //
+//   LD_LIBRARY_PATH=/gpu/lib64:/vendor/lib64:/system/lib64 \
+//     /data/local/tmp/gralloc1-probe --lifecycle [--no-teardown]
+//
 // The second form is the crash-loop test: it opens and closes the vendor HWC2
 // module without recovery being involved. The third registers the hotplug
 // callback, waits for it, and asks the composer about displays 0..3, which is
 // what settles why mali_display.cpp reports "primary display discovery failed".
+// The fourth walks getDisplayType/getDisplayName/setPowerMode/getActiveConfig/
+// getDisplayAttribute one at a time and re-asks getDisplayConfigs() after each,
+// because this composer keeps a per-display "connected" flag that nothing seems
+// to set at open time.
 //
 // LD_LIBRARY_PATH must contain the staged Android 12 libraries, because the
 // shim dlopens the vendor allocator impl, whose own DT_NEEDED (libhidlbase,
@@ -163,7 +170,7 @@ void HotplugCallback(hwc2_callback_data_t, hwc2_display_t display, int32_t state
          static_cast<int>(gettid()));
 }
 
-int RunHotplugProbe(const char* path) {
+int RunHotplugProbe(const char* path, bool teardown) {
   printf("hwc     : %s\n", path);
   void* library = dlopen(path, RTLD_NOW);
   if (library == nullptr) {
@@ -223,9 +230,130 @@ int RunHotplugProbe(const char* path) {
     }
   }
 
-  // ~Impl(): unregister, close, dlclose. If a worker thread is still inside the
-  // module when the last dlclose runs, this is where recovery dies.
+  // ~Impl(): unregister, close, dlclose. This is where recovery dies:
+  //
+  //   I hwcomposer: [ASYNCBLTDEV] ~AsyncBlitDevice
+  //   I scudo     : Scudo ERROR: misaligned pointer when deallocating address 0x...
+  //
+  // i.e. MTK's Android 12 destructor frees an interior/tagged pointer that
+  // Android 16's allocator refuses. --no-teardown stops before it, so a run can
+  // end cleanly when the question is only about hotplug.
+  if (!teardown) {
+    printf("teardown: skipped (--no-teardown); leaving the module loaded\n");
+    return 0;
+  }
   printf("unreg   : %d\n", reg(device, HWC2_CALLBACK_HOTPLUG, nullptr, nullptr));
+  printf("close   : %d\n", device->common.close(&device->common));
+  printf("dlclose : %d\n", dlclose(library));
+  printf("survived the teardown\n");
+  return 0;
+}
+
+// ---------------------------------------------------------------------------
+// --lifecycle: which call makes MTK's composer admit display 0 exists
+// ---------------------------------------------------------------------------
+// --hotplug showed that this composer never delivers a hotplug callback for the
+// primary display, so mali_display.cpp's "connected right after registration"
+// check can never pass. But the display object *does* exist -- the composer
+// answers with
+//
+//   E hwcomposer: [HWC] displayGetConfigs: the display(0) is not connected
+//
+// i.e. HWC2_ERROR_BAD_DISPLAY for id 0 and "this display(3) is invalid" for ids
+// past the end. So something has to flip that per-display "connected" flag, and
+// SurfaceFlinger does call setPowerMode()/getActiveConfig()/getDisplayType()
+// around the same point in its own init. This mode calls them one at a time and
+// re-asks getDisplayConfigs() after each, so the answer is which call connects
+// the display -- if any of them does.
+int RunLifecycleProbe(const char* path, bool teardown) {
+  printf("hwc     : %s\n", path);
+  void* library = dlopen(path, RTLD_NOW);
+  if (library == nullptr) {
+    printf("dlopen  : %s\n", dlerror());
+    return 1;
+  }
+  auto* module = static_cast<hw_module_t*>(dlsym(library, HAL_MODULE_INFO_SYM_AS_STR));
+  if (module == nullptr || module->methods == nullptr || module->methods->open == nullptr) {
+    printf("dlsym/open: %s\n", module == nullptr ? dlerror() : "no methods->open");
+    return 1;
+  }
+  hw_device_t* base = nullptr;
+  if (module->methods->open(module, "composer", &base) != 0 || base == nullptr) {
+    printf("hwcomposer open failed\n");
+    return 1;
+  }
+  auto* device = reinterpret_cast<hwc2_device_t*>(base);
+
+  auto configs = reinterpret_cast<HWC2_PFN_GET_DISPLAY_CONFIGS>(
+      device->getFunction(device, HWC2_FUNCTION_GET_DISPLAY_CONFIGS));
+  auto type = reinterpret_cast<HWC2_PFN_GET_DISPLAY_TYPE>(
+      device->getFunction(device, HWC2_FUNCTION_GET_DISPLAY_TYPE));
+  auto power = reinterpret_cast<HWC2_PFN_SET_POWER_MODE>(
+      device->getFunction(device, HWC2_FUNCTION_SET_POWER_MODE));
+  auto active = reinterpret_cast<HWC2_PFN_GET_ACTIVE_CONFIG>(
+      device->getFunction(device, HWC2_FUNCTION_GET_ACTIVE_CONFIG));
+  auto attribute = reinterpret_cast<HWC2_PFN_GET_DISPLAY_ATTRIBUTE>(
+      device->getFunction(device, HWC2_FUNCTION_GET_DISPLAY_ATTRIBUTE));
+  auto name = reinterpret_cast<HWC2_PFN_GET_DISPLAY_NAME>(
+      device->getFunction(device, HWC2_FUNCTION_GET_DISPLAY_NAME));
+  printf("lookup  : configs=%p type=%p power=%p active=%p attribute=%p name=%p\n",
+         reinterpret_cast<void*>(configs), reinterpret_cast<void*>(type),
+         reinterpret_cast<void*>(power), reinterpret_cast<void*>(active),
+         reinterpret_cast<void*>(attribute), reinterpret_cast<void*>(name));
+  if (configs == nullptr) {
+    printf("no getDisplayConfigs\n");
+    return 1;
+  }
+
+  auto report = [&](const char* step) {
+    uint32_t count = 0;
+    const int rc = configs(device, 0, &count, nullptr);
+    printf("  %-26s getDisplayConfigs(0) -> %d (%s), %u config(s)\n", step, rc,
+           rc == 0 ? "OK" : rc == 2 ? "BAD_DISPLAY" : "other", count);
+  };
+
+  printf("display 0:\n");
+  report("as opened");
+  if (type) {
+    int32_t value = -1;
+    const int rc = type(device, 0, &value);
+    printf("  %-26s -> %d, type=%d (0=physical)\n", "getDisplayType(0)", rc, value);
+  }
+  if (name) {
+    uint32_t size = 0;
+    const int rc = name(device, 0, &size, nullptr);
+    printf("  %-26s -> %d, name size=%u\n", "getDisplayName(0)", rc, size);
+  }
+  if (power) {
+    const int rc = power(device, 0, HWC2_POWER_MODE_ON);
+    printf("  %-26s -> %d\n", "setPowerMode(0, ON)", rc);
+  }
+  report("after power on");
+  if (active) {
+    uint32_t config = 0;
+    const int rc = active(device, 0, &config);
+    printf("  %-26s -> %d, config=%u\n", "getActiveConfig(0)", rc, config);
+  }
+  report("after getActiveConfig");
+  if (attribute) {
+    // 0 = WIDTH, 1 = HEIGHT, 2 = VSYNC_PERIOD, 3 = DPI_X, 4 = DPI_Y
+    for (int32_t which = 0; which <= 4; ++which) {
+      int32_t value = -1;
+      const int rc = attribute(device, 0, 0, which, &value);
+      printf("  getDisplayAttribute(0,0,%d)    -> %d, value=%d\n", which, rc, value);
+    }
+  }
+  report("after attributes");
+  if (power) {
+    const int rc = power(device, 0, HWC2_POWER_MODE_OFF);
+    printf("  %-26s -> %d\n", "setPowerMode(0, OFF)", rc);
+  }
+  report("after power off");
+
+  if (!teardown) {
+    printf("teardown: skipped (--no-teardown)\n");
+    return 0;
+  }
   printf("close   : %d\n", device->common.close(&device->common));
   printf("dlclose : %d\n", dlclose(library));
   printf("survived the teardown\n");
@@ -272,10 +400,22 @@ int main(int argc, char** argv) {
 
   if (argc > 1 && strcmp(argv[1], "--hotplug") == 0) {
     const char* hwc_path = "/gpu/stock-vendor/lib64/hw/hwcomposer.mt6768.so";
+    bool teardown = true;
     for (int i = 2; i < argc; ++i) {
-      if (strncmp(argv[i], "--", 2) != 0) hwc_path = argv[i];
+      if (strcmp(argv[i], "--no-teardown") == 0) teardown = false;
+      else if (strncmp(argv[i], "--", 2) != 0) hwc_path = argv[i];
     }
-    return RunHotplugProbe(hwc_path);
+    return RunHotplugProbe(hwc_path, teardown);
+  }
+
+  if (argc > 1 && strcmp(argv[1], "--lifecycle") == 0) {
+    const char* hwc_path = "/gpu/stock-vendor/lib64/hw/hwcomposer.mt6768.so";
+    bool teardown = true;
+    for (int i = 2; i < argc; ++i) {
+      if (strcmp(argv[i], "--no-teardown") == 0) teardown = false;
+      else if (strncmp(argv[i], "--", 2) != 0) hwc_path = argv[i];
+    }
+    return RunLifecycleProbe(hwc_path, teardown);
   }
 
   const char* path = argc > 1 ? argv[1]
