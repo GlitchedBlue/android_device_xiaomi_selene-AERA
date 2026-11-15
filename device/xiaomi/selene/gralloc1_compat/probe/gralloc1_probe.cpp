@@ -34,6 +34,9 @@
 //   LD_LIBRARY_PATH=/gpu/lib64:/vendor/lib64:/system/lib64 \
 //     /data/local/tmp/gralloc1-probe --present [hwcomposer.so] [gralloc.so] [w] [h]
 //
+//   LD_LIBRARY_PATH=/gpu/lib64:/vendor/lib64:/system/lib64 \
+//     /data/local/tmp/gralloc1-probe --egl [libGLES_mali.so] [gralloc.so] [w] [h]
+//
 // The second form is the crash-loop test: it opens and closes the vendor HWC2
 // module without recovery being involved. The third registers the hotplug
 // callback, waits for it, and asks the composer about displays 0..3, which is
@@ -47,15 +50,23 @@
 // shim dlopens the vendor allocator impl, whose own DT_NEEDED (libhidlbase,
 // libion, libdrm, ...) have to resolve to the vendor copies.
 
+#include <android/dlext.h>
 #include <dlfcn.h>
 #include <errno.h>
 #include <malloc.h>
 #include <poll.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
+#include <EGL/egl.h>
+#include <EGL/eglext.h>
+#include <GLES2/gl2.h>
+#include <GLES2/gl2ext.h>
+
+#include <hardware/gralloc.h>
 #include <hardware/gralloc1.h>
 #include <hardware/hardware.h>
 #include <hardware/hwcomposer2.h>
@@ -443,7 +454,8 @@ int RunLifecycleProbe(const char* path, bool teardown) {
 // fail on its own, and each failure otherwise costs a two-and-a-half-hour image
 // build to discover.
 bool AllocateScanout(const char* shim_path, uint32_t width, uint32_t height,
-                     buffer_handle_t* out, int count, gralloc1_device_t** out_device) {
+                     buffer_handle_t* out, int count, gralloc1_device_t** out_device,
+                     uint32_t* out_strides = nullptr) {
   void* library = dlopen(shim_path, RTLD_NOW);
   if (library == nullptr) {
     printf("shim    : dlopen failed: %s\n", dlerror());
@@ -499,6 +511,7 @@ bool AllocateScanout(const char* shim_path, uint32_t width, uint32_t height,
     const int rc = ALLOCATE(device, 1, &descriptor, &out[i]);
     uint32_t stride = 0;
     if (rc == GRALLOC1_ERROR_NONE && out[i] != nullptr) GET_STRIDE(device, out[i], &stride);
+    if (out_strides != nullptr) out_strides[i] = stride;
     printf("shim    : allocate %d -> %d handle=%p stride=%u\n", i, rc,
            static_cast<const void*>(out[i]), stride);
     ok = ok && rc == GRALLOC1_ERROR_NONE && out[i] != nullptr;
@@ -656,6 +669,328 @@ int RunPresentProbe(const char* hwc_path, const char* shim_path, uint32_t width,
   return failures == 0 ? 0 : 1;
 }
 
+// ---------------------------------------------------------------------------
+// --egl: the EGL half of GpuRenderer::Initialize()
+// ---------------------------------------------------------------------------
+// Everything between "Mali: primary display discovery failed" and
+// "Mali HWC2 GPU ready" is EGL work, and GpuRenderer::Initialize() logs nothing
+// when any of it fails: it just returns false and AERA silently falls back to the
+// software renderer. Reproducing it here makes those failures visible in 90
+// seconds instead of one image build each.
+//
+// The sequence is the tree's, step for step: libdl_android namespace, driver
+// dlopen inside it, pbuffer context, then the shim's scanout buffer imported as
+// an EGLImage and attached to a framebuffer. The final glReadPixels is the part
+// that proves Mali really rendered into the shim allocation rather than
+// somewhere else.
+struct ProbeNativeBase {
+  int magic;
+  int version;
+  void* reserved[4];
+  void (*incRef)(ProbeNativeBase*);
+  void (*decRef)(ProbeNativeBase*);
+};
+
+// AOSP's ANativeWindowBuffer (system/window.h). mali_display.cpp fills in the
+// same struct from nativebase/nativebase.h, and mali_gralloc reads width, height,
+// stride, format and handle out of it, so the layout has to match exactly. The
+// size is printed at startup: 168 on arm64.
+struct ProbeWindowBuffer {
+  ProbeNativeBase common;
+  int width;
+  int height;
+  int stride;
+  int format;
+  int usage_deprecated;
+  uintptr_t layerCount;
+  void* reserved[1];
+  const native_handle_t* handle;
+  uint64_t usage;
+  void* reserved2[8];
+};
+
+void ProbeReference(ProbeNativeBase*) {}
+
+// Same bits as kNativeUsage in mali_display.cpp.
+constexpr uint64_t kProbeNativeUsage = GRALLOC_USAGE_HW_RENDER |
+                                       GRALLOC_USAGE_HW_COMPOSER |
+                                       GRALLOC_USAGE_HW_FB |
+                                       GRALLOC_USAGE_SW_READ_OFTEN |
+                                       GRALLOC_USAGE_SW_WRITE_OFTEN;
+
+bool HasExtension(const char* list, const char* name) {
+  if (list == nullptr || name == nullptr) return false;
+  const size_t length = strlen(name);
+  for (const char* at = list; (at = strstr(at, name)) != nullptr; at += length) {
+    const bool starts = at == list || at[-1] == ' ';
+    const bool ends = at[length] == ' ' || at[length] == '\0';
+    if (starts && ends) return true;
+  }
+  return false;
+}
+
+template <typename T>
+bool LoadEglSymbol(void* library, const char* name, T* out) {
+  *out = reinterpret_cast<T>(dlsym(library, name));
+  if (*out == nullptr) printf("egl     : no %s\n", name);
+  return *out != nullptr;
+}
+
+template <typename T>
+bool LoadGlSymbol(void* library, PFNEGLGETPROCADDRESSPROC get_proc_address,
+                  const char* name, T* out) {
+  *out = reinterpret_cast<T>(get_proc_address(name));
+  if (*out == nullptr) *out = reinterpret_cast<T>(dlsym(library, name));
+  if (*out == nullptr) printf("gles    : no %s\n", name);
+  return *out != nullptr;
+}
+
+int RunEglProbe(const char* driver_path, const char* shim_path, uint32_t width,
+                uint32_t height) {
+  printf("egl     : sizeof(ProbeWindowBuffer)=%zu (arm64 expects 168)\n",
+         sizeof(ProbeWindowBuffer));
+  printf("egl     : driver %s\n", driver_path);
+
+  // 1. The driver lives outside the default namespace, exactly as in
+  //    MaliDisplay::OpenDriver(): libdl_android creates a namespace whose search
+  //    path is the staged /gpu/lib64 and which may reach /gpu and /vendor.
+  void* linker = dlopen("libdl_android.so", RTLD_NOW);
+  if (linker == nullptr) {
+    printf("linker  : dlopen failed: %s\n", dlerror());
+    return 1;
+  }
+  using CreateNamespace = android_namespace_t* (*)(const char*, const char*,
+      const char*, uint64_t, const char*, android_namespace_t*);
+  using LinkNamespace = bool (*)(android_namespace_t*, android_namespace_t*,
+                                 const char*);
+  auto create_namespace =
+      reinterpret_cast<CreateNamespace>(dlsym(linker, "android_create_namespace"));
+  auto link_namespaces =
+      reinterpret_cast<LinkNamespace>(dlsym(linker, "android_link_namespaces"));
+  if (create_namespace == nullptr || link_namespaces == nullptr) {
+    printf("linker  : namespace API missing: %s\n", dlerror());
+    return 1;
+  }
+  android_namespace_t* driver_namespace = create_namespace(
+      "aera_mali", "/gpu/lib64", "/gpu/lib64", 1, "/gpu:/vendor", nullptr);
+  if (driver_namespace == nullptr) {
+    printf("linker  : android_create_namespace failed\n");
+    return 1;
+  }
+  if (!link_namespaces(driver_namespace, nullptr, "libc.so:libm.so:libdl.so")) {
+    printf("linker  : android_link_namespaces failed\n");
+    return 1;
+  }
+  android_dlextinfo info{};
+  info.flags = ANDROID_DLEXT_USE_NAMESPACE;
+  info.library_namespace = driver_namespace;
+  void* driver = android_dlopen_ext(driver_path, RTLD_NOW, &info);
+  printf("driver  : dlopen -> %p%s%s\n", driver, driver ? "" : " ",
+         driver ? "" : dlerror());
+  if (driver == nullptr) return 1;
+
+  // 2. EGL bootstrap.
+  PFNEGLGETDISPLAYPROC get_display = nullptr;
+  PFNEGLINITIALIZEPROC initialize = nullptr;
+  PFNEGLGETPROCADDRESSPROC get_proc_address = nullptr;
+  PFNEGLTERMINATEPROC terminate = nullptr;
+  PFNEGLGETERRORPROC get_error = nullptr;
+  if (!LoadEglSymbol(driver, "eglGetDisplay", &get_display) ||
+      !LoadEglSymbol(driver, "eglInitialize", &initialize) ||
+      !LoadEglSymbol(driver, "eglGetProcAddress", &get_proc_address) ||
+      !LoadEglSymbol(driver, "eglTerminate", &terminate) ||
+      !LoadEglSymbol(driver, "eglGetError", &get_error)) {
+    printf("egl     : bootstrap incomplete\n");
+    return 1;
+  }
+  EGLDisplay display = get_display(EGL_DEFAULT_DISPLAY);
+  EGLint major = 0;
+  EGLint minor = 0;
+  if (display == EGL_NO_DISPLAY || !initialize(display, &major, &minor)) {
+    printf("egl     : eglInitialize failed: %#x\n", get_error());
+    return 1;
+  }
+  printf("egl     : initialized %d.%d\n", major, minor);
+
+  PFNEGLQUERYSTRINGPROC query_string = nullptr;
+  PFNEGLCHOOSECONFIGPROC choose_config = nullptr;
+  PFNEGLCREATEPBUFFERSURFACEPROC create_pbuffer = nullptr;
+  PFNEGLCREATECONTEXTPROC create_context = nullptr;
+  PFNEGLMAKECURRENTPROC make_current = nullptr;
+  PFNEGLBINDAPIPROC bind_api = nullptr;
+  PFNEGLCREATEIMAGEKHRPROC create_image = nullptr;
+  PFNEGLDESTROYIMAGEKHRPROC destroy_image = nullptr;
+  if (!LoadEglSymbol(driver, "eglQueryString", &query_string) ||
+      !LoadEglSymbol(driver, "eglChooseConfig", &choose_config) ||
+      !LoadEglSymbol(driver, "eglCreatePbufferSurface", &create_pbuffer) ||
+      !LoadEglSymbol(driver, "eglCreateContext", &create_context) ||
+      !LoadEglSymbol(driver, "eglMakeCurrent", &make_current) ||
+      !LoadEglSymbol(driver, "eglBindAPI", &bind_api) ||
+      !LoadEglSymbol(driver, "eglCreateImageKHR", &create_image) ||
+      !LoadEglSymbol(driver, "eglDestroyImageKHR", &destroy_image)) {
+    printf("egl     : entry points incomplete\n");
+    return 1;
+  }
+
+  const char* egl_extensions = query_string(display, EGL_EXTENSIONS);
+  printf("egl     : extensions %s\n",
+         egl_extensions == nullptr ? "(null)" : egl_extensions);
+  printf("egl     : EGL_ANDROID_image_native_buffer -> %s\n",
+         HasExtension(egl_extensions, "EGL_ANDROID_image_native_buffer") ? "yes"
+                                                                        : "NO");
+  if (!bind_api(EGL_OPENGL_ES_API)) {
+    printf("egl     : eglBindAPI failed: %#x\n", get_error());
+    return 1;
+  }
+
+  const EGLint config_attributes[] = {
+      EGL_SURFACE_TYPE, EGL_PBUFFER_BIT,
+      EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
+      EGL_RED_SIZE, 8,
+      EGL_GREEN_SIZE, 8,
+      EGL_BLUE_SIZE, 8,
+      EGL_ALPHA_SIZE, 8,
+      EGL_NONE,
+  };
+  EGLConfig config = nullptr;
+  EGLint config_count = 0;
+  if (!choose_config(display, config_attributes, &config, 1, &config_count) ||
+      config_count != 1) {
+    printf("egl     : no pbuffer config: %#x\n", get_error());
+    return 1;
+  }
+  const EGLint surface_attributes[] = {EGL_WIDTH, 1, EGL_HEIGHT, 1, EGL_NONE};
+  const EGLint context_attributes[] = {EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE};
+  EGLSurface surface = create_pbuffer(display, config, surface_attributes);
+  EGLContext context =
+      create_context(display, config, EGL_NO_CONTEXT, context_attributes);
+  if (surface == EGL_NO_SURFACE || context == EGL_NO_CONTEXT ||
+      !make_current(display, surface, surface, context)) {
+    printf("egl     : context creation failed: %#x\n", get_error());
+    return 1;
+  }
+
+  // 3. GLES entry points, through eglGetProcAddress like glad does.
+  PFNGLGETSTRINGPROC gl_get_string = nullptr;
+  PFNGLGETERRORPROC gl_get_error = nullptr;
+  PFNGLGENTEXTURESPROC gl_gen_textures = nullptr;
+  PFNGLBINDTEXTUREPROC gl_bind_texture = nullptr;
+  PFNGLTEXPARAMETERIPROC gl_tex_parameteri = nullptr;
+  PFNGLGENFRAMEBUFFERSPROC gl_gen_framebuffers = nullptr;
+  PFNGLBINDFRAMEBUFFERPROC gl_bind_framebuffer = nullptr;
+  PFNGLFRAMEBUFFERTEXTURE2DPROC gl_framebuffer_texture2d = nullptr;
+  PFNGLCHECKFRAMEBUFFERSTATUSPROC gl_check_framebuffer_status = nullptr;
+  PFNGLVIEWPORTPROC gl_viewport = nullptr;
+  PFNGLCLEARCOLORPROC gl_clear_color = nullptr;
+  PFNGLCLEARPROC gl_clear = nullptr;
+  PFNGLFINISHPROC gl_finish = nullptr;
+  PFNGLREADPIXELSPROC gl_read_pixels = nullptr;
+  auto image_target = reinterpret_cast<PFNGLEGLIMAGETARGETTEXTURE2DOESPROC>(
+      get_proc_address("glEGLImageTargetTexture2DOES"));
+  if (image_target == nullptr)
+    image_target = reinterpret_cast<PFNGLEGLIMAGETARGETTEXTURE2DOESPROC>(
+        dlsym(driver, "glEGLImageTargetTexture2DOES"));
+  if (!LoadGlSymbol(driver, get_proc_address, "glGetString", &gl_get_string) ||
+      !LoadGlSymbol(driver, get_proc_address, "glGetError", &gl_get_error) ||
+      !LoadGlSymbol(driver, get_proc_address, "glGenTextures", &gl_gen_textures) ||
+      !LoadGlSymbol(driver, get_proc_address, "glBindTexture", &gl_bind_texture) ||
+      !LoadGlSymbol(driver, get_proc_address, "glTexParameteri", &gl_tex_parameteri) ||
+      !LoadGlSymbol(driver, get_proc_address, "glGenFramebuffers", &gl_gen_framebuffers) ||
+      !LoadGlSymbol(driver, get_proc_address, "glBindFramebuffer", &gl_bind_framebuffer) ||
+      !LoadGlSymbol(driver, get_proc_address, "glFramebufferTexture2D",
+                    &gl_framebuffer_texture2d) ||
+      !LoadGlSymbol(driver, get_proc_address, "glCheckFramebufferStatus",
+                    &gl_check_framebuffer_status) ||
+      !LoadGlSymbol(driver, get_proc_address, "glViewport", &gl_viewport) ||
+      !LoadGlSymbol(driver, get_proc_address, "glClearColor", &gl_clear_color) ||
+      !LoadGlSymbol(driver, get_proc_address, "glClear", &gl_clear) ||
+      !LoadGlSymbol(driver, get_proc_address, "glFinish", &gl_finish) ||
+      !LoadGlSymbol(driver, get_proc_address, "glReadPixels", &gl_read_pixels)) {
+    printf("gles    : entry points incomplete\n");
+    return 1;
+  }
+
+  const char* gl_extensions =
+      reinterpret_cast<const char*>(gl_get_string(GL_EXTENSIONS));
+  printf("gles    : renderer %s\n",
+         reinterpret_cast<const char*>(gl_get_string(GL_RENDERER)));
+  printf("gles    : version %s\n",
+         reinterpret_cast<const char*>(gl_get_string(GL_VERSION)));
+  printf("gles    : GL_OES_EGL_image -> %s\n",
+         HasExtension(gl_extensions, "GL_OES_EGL_image") ? "yes" : "NO");
+  if (image_target == nullptr) {
+    printf("gles    : no glEGLImageTargetTexture2DOES\n");
+    return 1;
+  }
+
+  // 4. Import the shim's scanout buffer and render into it.
+  buffer_handle_t buffers[2] = {nullptr, nullptr};
+  uint32_t strides[2] = {0, 0};
+  gralloc1_device_t* allocator = nullptr;
+  if (!AllocateScanout(shim_path, width, height, buffers, 2, &allocator, strides)) return 1;
+
+  GLuint textures[2] = {};
+  GLuint framebuffers[2] = {};
+  EGLImageKHR images[2] = {EGL_NO_IMAGE_KHR, EGL_NO_IMAGE_KHR};
+  gl_gen_textures(2, textures);
+  gl_gen_framebuffers(2, framebuffers);
+  int failures = 0;
+  for (int i = 0; i < 2; ++i) {
+    ProbeWindowBuffer window{};
+    window.common.incRef = ProbeReference;
+    window.common.decRef = ProbeReference;
+    window.width = static_cast<int>(width);
+    window.height = static_cast<int>(height);
+    window.stride = static_cast<int>(strides[i]);
+    window.format = HAL_PIXEL_FORMAT_RGBA_8888;
+    window.layerCount = 1;
+    window.handle = buffers[i];
+    window.usage = kProbeNativeUsage;
+    window.usage_deprecated = static_cast<int>(window.usage);
+
+    const EGLint image_attributes[] = {EGL_IMAGE_PRESERVED_KHR, EGL_TRUE, EGL_NONE};
+    images[i] = create_image(display, EGL_NO_CONTEXT, EGL_NATIVE_BUFFER_ANDROID,
+                             &window, image_attributes);
+    printf("image %d : eglCreateImageKHR -> %p%s\n", i, images[i],
+           images[i] == EGL_NO_IMAGE_KHR ? " (failed)" : "");
+    if (images[i] == EGL_NO_IMAGE_KHR) {
+      printf("image %d : eglGetError %#x\n", i, get_error());
+      ++failures;
+      continue;
+    }
+    gl_bind_texture(GL_TEXTURE_2D, textures[i]);
+    gl_tex_parameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    gl_tex_parameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    gl_tex_parameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    gl_tex_parameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    image_target(GL_TEXTURE_2D, images[i]);
+    printf("image %d : target texture error %#x\n", i, gl_get_error());
+    gl_bind_framebuffer(GL_FRAMEBUFFER, framebuffers[i]);
+    gl_framebuffer_texture2d(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
+                             textures[i], 0);
+    const GLenum status = gl_check_framebuffer_status(GL_FRAMEBUFFER);
+    printf("image %d : framebuffer %#x%s\n", i, status,
+           status == GL_FRAMEBUFFER_COMPLETE ? " (complete)" : " (INCOMPLETE)");
+    if (status != GL_FRAMEBUFFER_COMPLETE) ++failures;
+  }
+
+  if (failures == 0) {
+    gl_bind_framebuffer(GL_FRAMEBUFFER, framebuffers[0]);
+    gl_viewport(0, 0, static_cast<GLsizei>(width), static_cast<GLsizei>(height));
+    gl_clear_color(0.0f, 1.0f, 0.0f, 1.0f);
+    gl_clear(GL_COLOR_BUFFER_BIT);
+    gl_finish();
+    uint8_t pixel[4] = {0, 0, 0, 0};
+    gl_read_pixels(0, 0, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, pixel);
+    printf("render  : cleared green, glReadPixels -> %u %u %u %u (want 0 255 0 255)\n",
+           pixel[0], pixel[1], pixel[2], pixel[3]);
+    if (pixel[1] != 255) ++failures;
+  }
+
+  printf("teardown: %d failure(s); the driver is not unloaded\n", failures);
+  return failures == 0 ? 0 : 1;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -709,6 +1044,23 @@ int main(int argc, char** argv) {
       ++positional;
     }
     return RunPresentProbe(hwc_path, shim_path, width, height);
+  }
+
+  if (argc > 1 && strcmp(argv[1], "--egl") == 0) {
+    const char* driver_path = "/gpu/stock-vendor/lib64/egl/libGLES_mali.so";
+    const char* shim_path = "/gpu/stock-vendor/lib64/hw/gralloc.mt6768.so";
+    uint32_t width = 1080;
+    uint32_t height = 2400;
+    int positional = 0;
+    for (int i = 2; i < argc; ++i) {
+      if (strncmp(argv[i], "--", 2) == 0) continue;
+      if (positional == 0) driver_path = argv[i];
+      else if (positional == 1) shim_path = argv[i];
+      else if (positional == 2) width = static_cast<uint32_t>(strtoul(argv[i], nullptr, 0));
+      else if (positional == 3) height = static_cast<uint32_t>(strtoul(argv[i], nullptr, 0));
+      ++positional;
+    }
+    return RunEglProbe(driver_path, shim_path, width, height);
   }
 
   if (argc > 1 && strcmp(argv[1], "--hotplug") == 0) {
