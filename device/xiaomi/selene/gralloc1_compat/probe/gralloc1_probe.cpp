@@ -866,7 +866,7 @@ struct DmaBufFormat {
 };
 
 int RunEglProbe(const char* driver_path, const char* shim_path, uint32_t width,
-                uint32_t height, bool use_native) {
+                uint32_t height, bool use_native, bool matrix) {
   printf("egl     : sizeof(ProbeWindowBuffer)=%zu (arm64 expects 176)\n",
          sizeof(ProbeWindowBuffer));
   printf("egl     : driver %s\n", driver_path);
@@ -1073,15 +1073,77 @@ int RunEglProbe(const char* driver_path, const char* shim_path, uint32_t width,
   gl_gen_framebuffers(2, framebuffers);
 
   static const DmaBufFormat kFormats[] = {
-      {0x52474241u, "ABGR8888"},  // HAL_PIXEL_FORMAT_RGBA_8888
-      {0x34325241u, "ARGB8888"},
-      {0x34324258u, "XBGR8888"},
-      {0x34325258u, "XRGB8888"},
+      {0x34325241u, "AR24"},  // ARGB8888: A,R,G,B in a word -> B,G,R,A bytes
+      {0x34324241u, "AB24"},  // ABGR8888: A,B,G,R in a word -> R,G,B,A bytes
+      {0x34324752u, "RG24"},
+      {0x34324742u, "BG24"},
+      {0x34324258u, "XB24"},
+      {0x34325258u, "XR24"},
+      {0x42475241u, "'ARGB'"},
+      {0x52474241u, "'ABGR'"},
+      {0x41424752u, "'RGBA'"},
+      {0x41524742u, "'BGRA'"},
   };
+  constexpr int kFormatCount = sizeof(kFormats) / sizeof(kFormats[0]);
   int failures = 0;
   int fd_index = -1;
   int format_index = 0;
   bool use_modifier = false;
+
+  if (matrix) {
+    // Which fourcc does this driver accept, and what byte order does each one
+    // produce? "Accepted" alone is not enough: green is symmetric under an R/B
+    // swap, so every candidate is exercised with a red clear and the raw dma-buf
+    // is read back afterwards. The answer is the format whose raw bytes are
+    // R,G,B,A - i.e. the one HWC will interpret as HAL_PIXEL_FORMAT_RGBA_8888.
+    const int fd = buffers[0]->data[1];
+    const size_t length = static_cast<size_t>(strides[0]) * 4 * height;
+    void* mapped = mmap(nullptr, length, PROT_READ, MAP_SHARED, fd, 0);
+    if (mapped == MAP_FAILED) {
+      printf("formats : mmap fd=%d failed: %d\n", fd, errno);
+      return 1;
+    }
+    for (int f = 0; f < kFormatCount; ++f) {
+      EGLImageKHR image = TryDmaBufImport(create_image, display, fd, width, height,
+                                          strides[0], kFormats[f].fourcc, false);
+      if (image == EGL_NO_IMAGE_KHR) {
+        printf("formats : %-6s %#010x -> rejected (%#x)\n", kFormats[f].name,
+               kFormats[f].fourcc, get_error());
+        continue;
+      }
+      GLuint texture = 0;
+      GLuint framebuffer = 0;
+      gl_gen_textures(1, &texture);
+      gl_gen_framebuffers(1, &framebuffer);
+      gl_bind_texture(GL_TEXTURE_2D, texture);
+      gl_tex_parameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+      gl_tex_parameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+      image_target(GL_TEXTURE_2D, image);
+      gl_bind_framebuffer(GL_FRAMEBUFFER, framebuffer);
+      gl_framebuffer_texture2d(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
+                               texture, 0);
+      const GLenum status = gl_check_framebuffer_status(GL_FRAMEBUFFER);
+      gl_viewport(0, 0, static_cast<GLsizei>(width), static_cast<GLsizei>(height));
+      gl_clear_color(1.0f, 0.0f, 0.0f, 1.0f);
+      gl_clear(GL_COLOR_BUFFER_BIT);
+      gl_finish();
+      uint8_t pixel[4] = {0, 0, 0, 0};
+      gl_read_pixels(0, 0, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, pixel);
+      const auto* base = static_cast<const uint8_t*>(mapped);
+      const auto* centre =
+          base + (static_cast<size_t>(height / 2) * strides[0] + width / 2) * 4;
+      printf("formats : %-6s %#010x -> accepted fbo=%#x gl=%u,%u,%u,%u raw=%u,%u,%u,%u%s\n",
+             kFormats[f].name, kFormats[f].fourcc, status, pixel[0], pixel[1],
+             pixel[2], pixel[3], centre[0], centre[1], centre[2], centre[3],
+             centre[0] == 255 && centre[1] == 0 && centre[2] == 0
+                 ? "  <- R,G,B,A"
+                 : "");
+      destroy_image(display, image);
+    }
+    munmap(mapped, length);
+    return 0;
+  }
+
   for (int i = 0; i < 2; ++i) {
     printf("buffer %d: fds=%d ints=%d stride=%u\n", i, buffers[i]->numFds,
            buffers[i]->numInts, strides[i]);
@@ -1131,7 +1193,7 @@ int RunEglProbe(const char* driver_path, const char* shim_path, uint32_t width,
              ++k) {
           const int fd = buffers[i]->data[k];
           if (fd < 0) continue;
-          for (int f = 0; f < 4 && images[i] == EGL_NO_IMAGE_KHR; ++f) {
+          for (int f = 0; f < kFormatCount && images[i] == EGL_NO_IMAGE_KHR; ++f) {
             for (int m = 0; m < 2 && images[i] == EGL_NO_IMAGE_KHR; ++m) {
               images[i] = TryDmaBufImport(create_image, display, fd, width, height,
                                           strides[i], kFormats[f].fourcc, m != 0);
@@ -1281,10 +1343,15 @@ int main(int argc, char** argv) {
     uint32_t width = 1080;
     uint32_t height = 2400;
     bool use_native = false;
+    bool matrix = false;
     int positional = 0;
     for (int i = 2; i < argc; ++i) {
       if (strcmp(argv[i], "--native") == 0) {
         use_native = true;
+        continue;
+      }
+      if (strcmp(argv[i], "--formats") == 0) {
+        matrix = true;
         continue;
       }
       if (strncmp(argv[i], "--", 2) == 0) continue;
@@ -1294,7 +1361,7 @@ int main(int argc, char** argv) {
       else if (positional == 3) height = static_cast<uint32_t>(strtoul(argv[i], nullptr, 0));
       ++positional;
     }
-    return RunEglProbe(driver_path, shim_path, width, height, use_native);
+    return RunEglProbe(driver_path, shim_path, width, height, use_native, matrix);
   }
 
   if (argc > 1 && strcmp(argv[1], "--hotplug") == 0) {
