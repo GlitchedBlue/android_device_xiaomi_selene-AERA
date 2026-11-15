@@ -729,6 +729,50 @@ reproduces the old single-callback run), and
 same in `mali_display.cpp`: two no-op vsync/refresh callbacks, registered before
 hotplug, then the existing `connected` check passes.
 
+### The whole present path works, and the composer owns the acquire fence
+
+`gralloc1-probe --present` walks everything `Initialize()` and `Present()` do,
+in order, with two shim-allocated 1080x2400 buffers and three frames:
+
+```
+attr    : 1 -> 0 value=1080        (WIDTH)
+attr    : 2 -> 0 value=2400        (HEIGHT)
+attr    : 3 -> 0 value=16666667    (VSYNC_PERIOD, 60 Hz)
+power   : 0
+layer   : create -> 0 id=2
+shim    : allocate 0 -> 0 stride=1088
+frame 0 : target=0 validate=0 types=0 requests=0
+frame 0 : present=0 fence=29
+frame 1 : waited for the previous release fence -> 1 revents=0x1
+frame 1 : present=0 fence=32
+frame 2 : present=0 fence=32
+```
+
+Note the attribute enum: 0 is `INVALID`, so 1..5 are WIDTH/HEIGHT/VSYNC_PERIOD/
+DPI_X/DPI_Y. Asking for 0 returns `BAD_ATTRIBUTE` (-1), which is correct.
+
+The one thing that would have been wrong is the acquire fence.
+`HWCMediator::displaySetClientTarget` (0x6cd20) hands the fd straight to
+`HWCBuffer::setAcquireFenceFd`, which `protectedCloseImpl`s the *previous* fd and
+stores the new one — no `dup`. So the composer owns the descriptor and
+`MaliDisplay::Present()` must not close it, or the composer ends up waiting on a
+recycled fd number. mali_display's default is `caller` (close it), so `device.mk`
+sets:
+
+```
+ro.aera.gpu.hwc_acquire_fence_ownership=composer
+```
+
+One cosmetic leftover: the probe (and therefore recovery, which never unloads the
+composer) aborts at process exit with
+
+```
+FORTIFY: pthread_mutex_lock called on a destroyed mutex
+```
+
+because MTK's static destructors run at exit. Recovery does not return from a
+reboot, so this only matters if the process is ever exited normally.
+
 ### Patching the Mali backend
 
 The backend lives in `bootable/recovery` on apkreader's `mali-testing` branch,

@@ -97,6 +97,14 @@ PRODUCT_DEFAULT_PROPERTY_OVERRIDES += \
     ro.aera.gpu.mali_libraries=/gpu/lib64 \
     ro.aera.gpu.gralloc=/gpu/stock-vendor/lib64/hw/gralloc.mt6768.so \
     ro.aera.gpu.hwcomposer=/gpu/stock-vendor/lib64/hw/hwcomposer.mt6768.so \
-    ro.aera.gpu.mali_permitted_paths=/gpu:/vendor
+    ro.aera.gpu.mali_permitted_paths=/gpu:/vendor \
+    ro.aera.gpu.hwc_acquire_fence_ownership=composer
+
+# MTK's composer keeps the acquire fence fd that setClientTarget() is given
+# instead of dup()ing it: HWCMediator::displaySetClientTarget passes it straight
+# to HWCBuffer::setAcquireFenceFd, which closes the *previous* fd and stores the
+# new one. Closing it in MaliDisplay::Present() would therefore leave the
+# composer holding a recycled fd number, so it must own the descriptor.
+# ("caller" is mali_display.cpp's default, which is right for AOSP's composer.)
 
 $(call inherit-product, $(DEVICE_PATH)/aera_selene.mk)
