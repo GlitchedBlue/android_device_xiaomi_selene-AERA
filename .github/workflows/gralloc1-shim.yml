@@ -1,0 +1,109 @@
+name: gralloc1 shim (selene)
+
+# The gralloc1 shim is the only piece of the GPU work that changes often, and it
+# is NOT part of the recovery ramdisk: it is staged into the blob store on the
+# rescue partition and loaded through ro.aera.gpu.gralloc. So it does not need a
+# 2.5 hour image build to be testable -- an image build only re-validates it.
+#
+# This job compiles the same source against the same bionic ABI in about a
+# minute and uploads the .so, which is then `adb push`ed to
+# /gpu-rescue/aera-gpu/vendor/lib64/hw/gralloc.mt6768.so.
+#
+# The image workflow still builds the shim with Soong (stl: "none") and asserts
+# the same properties; that remains the canonical build. This one exists so that
+# descriptor/layout/debug changes cost minutes instead of hours.
+#
+# Why not ccache: AOSP removed ccache support (build/make/core/ccache.mk is gone
+# in 15 and 16), so USE_CCACHE is a no-op there. And out/ cannot be cached
+# between runs either -- it is 20+ GB against a 10 GB repository cache budget.
+
+on:
+  push:
+    branches:
+      - aera-16.0
+    paths:
+      - 'device/xiaomi/selene/gralloc1_compat/**'
+      - 'shim-headers/**'
+      - '.github/workflows/gralloc1-shim.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: gralloc1-shim
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  shim:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      # shim-headers/ is a pinned copy of the AOSP 16 headers the shim needs
+      # (hardware/{hardware,gralloc,gralloc1,fb}.h, cutils/native_handle.h,
+      # system/graphics*.h). The NDK does not ship libhardware, and pulling them
+      # from googlesource at build time would make the job depend on a moving
+      # branch; they are frozen API anyway.
+      - name: Locate the NDK
+        id: ndk
+        run: |
+          set -eu
+          found=""
+          for dir in "${ANDROID_NDK_LATEST_HOME:-}" "${ANDROID_NDK_HOME:-}" \
+                     "${ANDROID_HOME:-/usr/local/lib/android/sdk}"/ndk/*; do
+            [ -n "$dir" ] || continue
+            [ -x "$dir/toolchains/llvm/prebuilt/linux-x86_64/bin/clang++" ] || continue
+            found="$dir"
+          done
+          if [ -z "$found" ]; then
+            echo "::error::no Android NDK with clang++ was found on this runner"
+            ls -d "${ANDROID_HOME:-/usr/local/lib/android/sdk}"/ndk/* 2>/dev/null || true
+            exit 1
+          fi
+          echo "ndk=$found" >> "$GITHUB_OUTPUT"
+          echo "using $found"
+
+      - name: Compile
+        env:
+          NDK: ${{ steps.ndk.outputs.ndk }}
+        run: |
+          set -eu
+          CXX="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/clang++"
+          mkdir -p artifacts
+          "$CXX" \
+            --target=aarch64-linux-android31 \
+            -std=gnu++17 -fPIC -shared \
+            -nostdlib++ -fno-exceptions -fno-rtti \
+            -Wall -Wextra -Wno-unused-parameter -fvisibility=default \
+            -I shim-headers \
+            -o artifacts/gralloc.mt6768.so \
+            device/xiaomi/selene/gralloc1_compat/gralloc1_shim.cpp
+          ls -l artifacts/gralloc.mt6768.so
+          sha256sum artifacts/gralloc.mt6768.so
+
+      # Same three properties the image build asserts with Soong, because they
+      # are what make the module loadable inside aera_mali: the namespace shares
+      # exactly libc/libm/libdl with the recovery process, so any other
+      # DT_NEEDED would have to be staged into the blob store as well.
+      - name: Assert the result is a loadable gralloc1 HAL
+        run: |
+          set -eu
+          so=artifacts/gralloc.mt6768.so
+          readelf -hW "$so" | grep -q 'AArch64' \
+            || { echo "::error::$so is not an AArch64 object"; readelf -hW "$so"; exit 1; }
+          readelf -sW "$so" | grep -q ' HAL_MODULE_INFO_SYM$' \
+            || { echo "::error::$so does not export HAL_MODULE_INFO_SYM"; readelf -sW "$so" | tail -30; exit 1; }
+          unexpected=$(readelf -dW "$so" | grep NEEDED | grep -Ev 'libc\.so|libm\.so|libdl\.so' || true)
+          if [ -n "$unexpected" ]; then
+            echo "::error::$so depends on a library the Mali namespace does not share"
+            echo "$unexpected"
+            exit 1
+          fi
+          echo "DT_NEEDED: $(readelf -dW "$so" | grep NEEDED | tr -s ' ' | cut -d' ' -f6- | tr '\n' ' ')"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gralloc1-shim
+          path: artifacts/gralloc.mt6768.so
+          if-no-files-found: error
