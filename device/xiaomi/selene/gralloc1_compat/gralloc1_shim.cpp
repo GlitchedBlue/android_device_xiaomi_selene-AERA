@@ -79,6 +79,7 @@
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <malloc.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -170,6 +171,7 @@ struct Config {
   int format_type;
   int layer_count;
   int probe;
+  int heap_tagging;
 };
 
 uint32_t ParseUint(const char* text, uint32_t fallback) {
@@ -198,6 +200,7 @@ void ReadConfig(Config* config) {
   config->format_type = 0;
   config->layer_count = 1;
   config->probe = 1;
+  config->heap_tagging = 0;
   config->impl[0] = '\0';
 
   char buffer[1024];
@@ -225,12 +228,52 @@ void ReadConfig(Config* config) {
         config->layer_count = static_cast<int>(ParseUint(value, 1));
       } else if (strcmp(key, "probe") == 0) {
         config->probe = static_cast<int>(ParseUint(value, 1));
+      } else if (strcmp(key, "heap_tagging") == 0) {
+        config->heap_tagging = static_cast<int>(ParseUint(value, 0));
       } else {
         Log("config: ignoring unknown key %s", key);
       }
     }
     line = next;
   }
+}
+
+// ---------------------------------------------------------------------------
+// Heap tagging, disabled at load time
+// ---------------------------------------------------------------------------
+// MediaTek's Android 12 HWC2 module frees a pointer whose top-byte heap tag
+// Android 16's bionic rejects, and bionic treats that as fatal:
+//
+//   F/libc: Pointer tag for 0x... was truncated, see '.../tagged-pointers'
+//   F/libc: Fatal signal 6 (SIGABRT) ... (recovery)
+//
+// On selene that turned a failed Initialize() into a recovery crash loop. The
+// tag is not something the shim can fix -- it is inside the vendor binary -- but
+// the check is: mallopt(M_BIONIC_SET_HEAP_TAGGING_LEVEL, ...) is the documented
+// escape hatch, and it has to happen before hwcomposer allocates anything.
+//
+// This constructor runs when the shim is dlopen()ed, and mali_display.cpp loads
+// the allocator (this module) before it loads hwcomposer, so this is early
+// enough. Verified with the standalone probe: with tagging on, opening
+// hwcomposer aborts; with it off, open() returns 0, version 0x2000001, close()
+// returns 0 and the module unloads cleanly.
+//
+// Set heap_tagging=1 in /gpu/gralloc1.conf to keep A16's hardening and see the
+// crash again.
+__attribute__((constructor)) void ConfigureHeapTagging() {
+  Config config;
+  ReadConfig(&config);
+  if (config.heap_tagging) {
+    Log("heap tagging left enabled by %s (heap_tagging=1)", kConfigPath);
+    return;
+  }
+#if defined(__BIONIC__) && defined(M_BIONIC_SET_HEAP_TAGGING_LEVEL) && \
+    defined(M_HEAP_TAGGING_LEVEL_NONE)
+  const int rc = mallopt(M_BIONIC_SET_HEAP_TAGGING_LEVEL, M_HEAP_TAGGING_LEVEL_NONE);
+  Log("heap tagging disabled for this process (mallopt -> %d)", rc);
+#else
+  Log("heap tagging control is not available at build time");
+#endif
 }
 
 // ---------------------------------------------------------------------------

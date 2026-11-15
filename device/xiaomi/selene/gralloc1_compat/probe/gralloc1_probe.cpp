@@ -147,8 +147,11 @@ int main(int argc, char** argv) {
 #endif
 
   if (argc > 1 && strcmp(argv[1], "--hwc") == 0) {
-    return RunHwcProbe(argc > 2 ? argv[2]
-                                : "/gpu/stock-vendor/lib64/hw/hwcomposer.mt6768.so");
+    const char* hwc_path = "/gpu/stock-vendor/lib64/hw/hwcomposer.mt6768.so";
+    for (int i = 2; i < argc; ++i) {
+      if (strncmp(argv[i], "--", 2) != 0) hwc_path = argv[i];
+    }
+    return RunHwcProbe(hwc_path);
   }
 
   const char* path = argc > 1 ? argv[1]
