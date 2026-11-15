@@ -747,18 +747,26 @@ bool LoadGlSymbol(void* library, PFNEGLGETPROCADDRESSPROC get_proc_address,
 
 int RunEglProbe(const char* driver_path, const char* shim_path, uint32_t width,
                 uint32_t height) {
-  printf("egl     : sizeof(ProbeWindowBuffer)=%zu (arm64 expects 168)\n",
+  printf("egl     : sizeof(ProbeWindowBuffer)=%zu (arm64 expects 176)\n",
          sizeof(ProbeWindowBuffer));
   printf("egl     : driver %s\n", driver_path);
 
   // 1. The driver lives outside the default namespace, exactly as in
   //    MaliDisplay::OpenDriver(): libdl_android creates a namespace whose search
   //    path is the staged /gpu/lib64 and which may reach /gpu and /vendor.
-  void* linker = dlopen("libdl_android.so", RTLD_NOW);
+  //
+  //    The path is absolute on purpose. This probe is normally started with
+  //    LD_LIBRARY_PATH=/gpu/lib64 (the shim's vendor allocator needs it), and
+  //    /gpu/lib64/libdl_android.so is the staged Android 12 copy: loading that
+  //    into an Android 16 process segfaults, which is exactly what the first
+  //    --egl run did. Recovery does not set LD_LIBRARY_PATH, so it gets the
+  //    process copy from /system/lib64 -- and so must the probe.
+  void* linker = dlopen("/system/lib64/libdl_android.so", RTLD_NOW);
   if (linker == nullptr) {
     printf("linker  : dlopen failed: %s\n", dlerror());
     return 1;
   }
+  printf("linker  : /system/lib64/libdl_android.so -> %p\n", linker);
   using CreateNamespace = android_namespace_t* (*)(const char*, const char*,
       const char*, uint64_t, const char*, android_namespace_t*);
   using LinkNamespace = bool (*)(android_namespace_t*, android_namespace_t*,
@@ -767,23 +775,31 @@ int RunEglProbe(const char* driver_path, const char* shim_path, uint32_t width,
       reinterpret_cast<CreateNamespace>(dlsym(linker, "android_create_namespace"));
   auto link_namespaces =
       reinterpret_cast<LinkNamespace>(dlsym(linker, "android_link_namespaces"));
+  printf("linker  : create_namespace=%p link_namespaces=%p\n",
+         reinterpret_cast<void*>(create_namespace),
+         reinterpret_cast<void*>(link_namespaces));
   if (create_namespace == nullptr || link_namespaces == nullptr) {
     printf("linker  : namespace API missing: %s\n", dlerror());
     return 1;
   }
   android_namespace_t* driver_namespace = create_namespace(
       "aera_mali", "/gpu/lib64", "/gpu/lib64", 1, "/gpu:/vendor", nullptr);
+  printf("linker  : namespace -> %p\n", static_cast<void*>(driver_namespace));
   if (driver_namespace == nullptr) {
     printf("linker  : android_create_namespace failed\n");
     return 1;
   }
-  if (!link_namespaces(driver_namespace, nullptr, "libc.so:libm.so:libdl.so")) {
+  const bool linked =
+      link_namespaces(driver_namespace, nullptr, "libc.so:libm.so:libdl.so");
+  printf("linker  : link_namespaces -> %s\n", linked ? "true" : "false");
+  if (!linked) {
     printf("linker  : android_link_namespaces failed\n");
     return 1;
   }
   android_dlextinfo info{};
   info.flags = ANDROID_DLEXT_USE_NAMESPACE;
   info.library_namespace = driver_namespace;
+  printf("driver  : dlopen in the namespace...\n");
   void* driver = android_dlopen_ext(driver_path, RTLD_NOW, &info);
   printf("driver  : dlopen -> %p%s%s\n", driver, driver ? "" : " ",
          driver ? "" : dlerror());
