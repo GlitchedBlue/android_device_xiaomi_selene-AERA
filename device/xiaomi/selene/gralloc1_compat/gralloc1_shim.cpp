@@ -570,7 +570,13 @@ int Close(hw_device_t*) {
 
 int Open(const hw_module_t*, const char* name, hw_device_t** out) {
   if (out == nullptr) return -EINVAL;
-  if (name != nullptr && strcmp(name, GRALLOC_HARDWARE_GPU0) != 0) {
+  // AOSP 16's gralloc1_open() passes GRALLOC_HARDWARE_MODULE_ID ("gralloc");
+  // older callers pass GRALLOC_HARDWARE_GPU0 ("gpu0"). There is exactly one
+  // device here, so either name (or none) means the same thing -- and getting
+  // this wrong is invisible until a device tries to open the module, which is
+  // why the first probe run reported "unsupported id gralloc".
+  if (name != nullptr && strcmp(name, GRALLOC_HARDWARE_GPU0) != 0 &&
+      strcmp(name, GRALLOC_HARDWARE_MODULE_ID) != 0) {
     Log("unsupported id %s", name);
     return -EINVAL;
   }
