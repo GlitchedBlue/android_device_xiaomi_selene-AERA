@@ -43,6 +43,8 @@ on:
       # not part of the ramdisk: an image build only re-validates it. Editing it
       # alone must not cost two and a half hours.
       - '!device/xiaomi/selene/gralloc1_compat/**'
+      # A patch to a synced project only takes effect in an image build.
+      - 'patches/**'
       - '.github/workflows/build-aera.yml'
 
 concurrency:
@@ -243,6 +245,38 @@ jobs:
           cp -a "/tmp/dt/${DEVICE_PATH}" "${DEVICE_PATH}"
           chmod +x "${DEVICE_PATH}/vendorsetup.sh" 2>/dev/null || true
           echo "device tree files: $(find "${DEVICE_PATH}" -type f | wc -l)"
+
+      # ---------------------------------------------------------------------
+      # Local patches to synced projects
+      # ---------------------------------------------------------------------
+      # The Mali backend comes from apkreader's mali-testing branch, which is not
+      # ours to push to, and the fixes it needs are small and specific. They live
+      # in patches/<project path>/NNNN-*.patch in this repo and are applied here,
+      # after the branch switch above.
+      #
+      # `git apply --check` runs first for every patch: a context mismatch has to
+      # fail the build in the first two minutes, not after two and a half hours
+      # with an image that silently lacks the fix.
+      - name: Apply local patches
+        run: |
+          cd "${WORKDIR}"
+          root="${GITHUB_WORKSPACE}/patches"
+          shopt -s globstar nullglob
+          count=0
+          for patch in "$root"/**/*.patch; do
+            project="${patch#"$root"/}"
+            project="${project%/*}"
+            echo "applying $(basename "$patch") to ${project}"
+            if ! git -C "${project}" apply --check "${patch}"; then
+              echo "::error::$(basename "$patch") does not apply to ${project} (upstream context changed)"
+              exit 1
+            fi
+            git -C "${project}" apply "${patch}"
+            count=$((count + 1))
+          done
+          echo "patches applied: ${count}"
+          git -C bootable/recovery --no-pager log --oneline -1
+          git -C bootable/recovery --no-pager diff --stat
 
       # .repo holds the full git history of ~1000 projects. It is worthless
       # once the working tree exists, and dropping it reclaims ~18 GB right

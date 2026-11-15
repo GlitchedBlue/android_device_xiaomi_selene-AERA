@@ -1,0 +1,45 @@
+--- a/aeraui/core/mali_display.cpp
++++ b/aeraui/core/mali_display.cpp
+@@ -113,6 +113,9 @@
+     }
+   }
+ 
++  static void Vsync(hwc2_callback_data_t, hwc2_display_t, int64_t) {}
++  static void Refresh(hwc2_callback_data_t, hwc2_display_t) {}
++
+   void* Load(const std::string& path) {
+     android_dlextinfo info{};
+     info.flags = ANDROID_DLEXT_USE_NAMESPACE;
+@@ -121,8 +124,11 @@
+   }
+ 
+   ~Impl() {
+-    if (registered)
++    if (registered) {
+       register_callback(composer, HWC2_CALLBACK_HOTPLUG, nullptr, nullptr);
++      register_callback(composer, HWC2_CALLBACK_REFRESH, nullptr, nullptr);
++      register_callback(composer, HWC2_CALLBACK_VSYNC, nullptr, nullptr);
++    }
+     if (has_layer && destroy_layer)
+       destroy_layer(composer, display.load(), layer);
+     if (composer) composer->common.close(&composer->common);
+@@ -277,6 +283,19 @@
+       !GetFunction(state.composer, HWC2_FUNCTION_GET_RELEASE_FENCES, &state.get_release_fences) ||
+       !GetFunction(state.composer, HWC2_FUNCTION_DESTROY_LAYER, &state.destroy_layer))
+     return Fail("HWC2 function table");
++  // MTK's composer (hwcomposer.mt6768.so) does not fill in its display table
++  // until hotplug, vsync and refresh callbacks have all been registered:
++  // HWCMediator::deviceRegisterCallback() runs DisplayManager::init() from the
++  // shared tail of the function, and init() is what marks display 0 connected
++  // and re-sends the hotplug callback. Registering hotplug alone therefore
++  // never reports anything as connected, which used to look like a missing
++  // primary display. The two callbacks we do not otherwise need are no-ops and
++  // stay installed for the lifetime of the display.
++  if (state.register_callback(state.composer, HWC2_CALLBACK_VSYNC, &state,
++          reinterpret_cast<hwc2_function_pointer_t>(Impl::Vsync)) ||
++      state.register_callback(state.composer, HWC2_CALLBACK_REFRESH, &state,
++          reinterpret_cast<hwc2_function_pointer_t>(Impl::Refresh)))
++    return Fail("vsync/refresh registration");
+   if (state.register_callback(state.composer, HWC2_CALLBACK_HOTPLUG, &state,
+           reinterpret_cast<hwc2_function_pointer_t>(Impl::Hotplug)))
+     return Fail("hotplug registration");

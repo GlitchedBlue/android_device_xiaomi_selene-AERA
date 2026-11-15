@@ -518,8 +518,24 @@ header. Disassembling `mali_gralloc_buffer_allocate` (`0xb648`) and
 | `+0x34` | `format_type` | `ldr w1, [x19, #0x34]`, passed as `select_format`'s `mali_gralloc_format_type` |
 | `+0x58` | `size` (u64) | derive writes it; `allocator_allocate` reads it as the ION length |
 | `+0x68` | `internal_format` (u64) | `select_format`'s return value |
-| `+0x74` | `byte_stride` | copied to the handle's stride pair |
-| `+0x78` | `pixel_stride` | what `GET_STRIDE` must report |
+| `+0x74` | `pixel_stride` (16-px aligned width) | measured, see below |
+| `+0x78` | aligned height | measured, see below |
+
+The last two were **wrong in the first cut** — the disassembly suggested
+`byte_stride` at `0x74` and `pixel_stride` at `0x78`, but the device says
+otherwise:
+
+| Request | `field[0x74]` | `field[0x78]` | `size` |
+| --- | --- | --- | --- |
+| 1081x100 | **1088** | 100 | 435200 |
+| 1440x3200 | **1440** | 3200 | 18432000 |
+| 1080x2400 | **1088** | 2400 | 10444800 |
+
+`0x74` is the stride (1081 rounds up to 1088, a multiple of 16) and `0x78` is the
+height. The old fallback ("if the value is below the width, use the width")
+turned that into a plausible-looking `1081` for a 1081-wide buffer, i.e. a
+sheared scanout instead of an error — which is why this had to be measured
+rather than reasoned about.
 
 The highest offset the vendor code touches is `0xac`, so the shim hands over a
 zeroed `0x200`-byte buffer and pokes only these fields. Nothing else about
@@ -544,6 +560,46 @@ probe=1
 Everything is logged to `/tmp/gralloc1.log` (the shim has no liblog dependency
 on purpose: the namespace shares only libc/libm/libdl, so a `liblog` `DT_NEEDED`
 would have to be staged as well).
+
+Three things came out of running it, and two of them were shim bugs:
+
+1. **`gralloc1_open()` passes `"gralloc"`, not `"gpu0"`.** AOSP 16's inline
+   `gralloc1_open()` calls `module->methods->open(module,
+   GRALLOC_HARDWARE_MODULE_ID, ...)`, i.e. the string `"gralloc"`;
+   `GRALLOC_HARDWARE_GPU0` (`"gpu0"`) is the gralloc0-era name. The shim only
+   accepted `"gpu0"`, so every open failed with `unsupported id gralloc` before a
+   descriptor was touched. It now accepts both (there is one device behind the
+   module).
+2. **`0x74` is the stride and `0x78` is the height** — see the table above.
+3. **A 1080x2400 RGBA_8888 allocation is correct**: `error=0`, `size=10444800`,
+   `internal_format=0x1`, `stride=1088`, and it frees cleanly. `format_type=0`
+   and `layer_count=1` are the working pair, so the runtime probe in the shim is
+   no longer needed on the happy path (`probe=0` pins them).
+
+All of that was found with **`gralloc1-probe`**, not by rebooting into the
+backend. It is built by `.github/workflows/gralloc1-shim.yml` (runner NDK,
+~90 s) and pushed to `/data/local/tmp/`, and it does the same nine gralloc1 calls
+`mali_display.cpp` does:
+
+```
+adb shell 'LD_LIBRARY_PATH=/gpu/lib64:/system/lib64 /data/local/tmp/gralloc1-probe'
+adb shell 'LD_LIBRARY_PATH=/gpu/lib64:/system/lib64 /data/local/tmp/gralloc1-probe 1440 3200'
+adb shell 'LD_LIBRARY_PATH=/gpu/lib64:/system/lib64 /data/local/tmp/gralloc1-probe --hwc'
+adb shell 'LD_LIBRARY_PATH=/gpu/lib64:/system/lib64 /data/local/tmp/gralloc1-probe --hotplug'
+```
+
+`--hwc` opens/closes the vendor HWC2 module (the crash-loop path), `--hotplug`
+registers hotplug+vsync+refresh, waits for a callback and queries displays 0..3
+(`--only-hotplug` restores the old single-callback run), and `--lifecycle` calls
+the ordinary display functions one at a time. None of them needs an image build,
+and none restarts recovery.
+
+**Do not go back to iterating on the shim through an image build.** The shim is
+not in the ramdisk — it is staged into the blob store and named by
+`ro.aera.gpu.gralloc` — so `build-aera.yml` no longer triggers on
+`device/xiaomi/selene/gralloc1_compat/**` alone. The Soong build in the image is
+still the canonical one and still asserts AArch64 / `HMI` exported / no foreign
+`DT_NEEDED`, but it is not the iteration loop.
 
 ### Live debugging: the driver now loads, and two new facts
 
@@ -575,23 +631,123 @@ copied into the blob store, then parked in `/gpu-rescue/hold29` again because of
 the next point. The two gralloc4 impls need only `libdrm.so` on top of what is
 already staged.
 
-**Open issue: the Android 12 destructor aborts under Android 16's allocator.**
-Once `hwcomposer` loads, the failure path calls `~Impl()`, which `dlclose`s it,
-and MTK's Android 12 destructor frees a pointer whose top-byte tag Android 16's
-bionic rejects:
+**Solved: the Android 12 destructor aborted under Android 16's allocator.**
+Once `hwcomposer` loaded, the failure path called `~Impl()`, which `dlclose`d it,
+and MTK's Android 12 code freed a pointer whose top-byte tag Android 16's bionic
+rejects:
 
 ```
 F/libc: Pointer tag for 0x... was truncated, see '.../tagged-pointers'
 F/libc: Fatal signal 6 (SIGABRT) ... pid (recovery)
 ```
 
-That is a recovery crash loop, not a GPU failure. It is not caused by mounting
-`/vendor` (unmounting did not stop it). The likely fixes are
-`mallopt(M_BIONIC_SET_HEAP_TAGGING_LEVEL, M_HEAP_TAGGING_LEVEL_NONE)` in the
-loader, or not `dlclose`ing a HAL that failed to initialize — both are in
-`mali_display.cpp`, which this repo controls. With the gralloc1 shim present,
-`Initialize()` should no longer reach that path at all, so this may resolve
-itself; if it does not, that is the next thing to fix.
+It was not caused by mounting `/vendor` (mounting the real partition changed
+nothing; the `/vendor/etc/cust_pq.xml` warning is benign, that file is absent from
+the image too). `mallopt(M_BIONIC_SET_HEAP_TAGGING_LEVEL,
+M_HEAP_TAGGING_LEVEL_NONE)` is enough, and the shim now does it in a constructor —
+the shim is loaded before `hwcomposer` in `Initialize()`, so the setting is in
+place before the vendor module allocates. A/B proven with
+`gralloc1-probe --hwc --keep-tags` on the device:
+
+```
+tagging on   -> Pointer tag ... was truncated -> SIGABRT
+tagging off  -> open: 0, version 0x2000001 (HWC2: yes), close: 0, dlclose: 0
+```
+
+`heap_tagging=1` in `/gpu/gralloc1.conf` restores A16's hardening to reproduce it.
+
+### The next failure: `Mali: primary display discovery failed`
+
+With the shim allocating (`error=0`, `size=10444800`, `stride=1088` for
+1080x2400 RGBA_8888) and heap tagging off, the error advances again:
+
+```
+W/AeraGpu: Mali: primary display discovery failed
+F/libc   : Fatal signal 6 (SIGABRT) ... in tid <worker> (recovery)
+```
+
+Two separate defects, both in `mali_display.cpp`:
+
+1. `Initialize()` registers `HWC2_CALLBACK_HOTPLUG` and then checks
+   `state.connected` on the very next line, and registering hotplug alone can
+   never work on this composer (see the next section).
+2. `~Impl()` then `dlclose`s the composer, which runs MTK's destructors and
+   aborts. The earlier guess (a vendor worker thread still inside the module) was
+   wrong: the whole `Initialize()` runs on recovery's own render thread
+   (tid 11651 of pid 11640), the destructors run on that same thread, and the
+   vendor frees a pointer Android 16's allocator rejects:
+
+   ```
+   I hwcomposer: [ASYNCBLTDEV] ~AsyncBlitDevice
+   I scudo     : Scudo ERROR: misaligned pointer when deallocating address 0x...
+   ```
+
+   So both defects are in `mali_display.cpp`: not `dlclose`ing a HAL that failed
+   to initialize, and not depending on a callback this vendor never sends.
+
+**The display object exists; only its "connected" flag is false.** The composer
+says so itself:
+
+```
+E hwcomposer: [HWC] displayGetConfigs: the display(0) is not connected
+E hwcomposer: [HWC] displayGetConfigs: this display(3) is invalid
+```
+
+`HWC2_ERROR_BAD_DISPLAY` for id 0, "invalid" past the end of the table — so ids
+0..2 are real `HWCDisplay` objects and 3 is out of range.
+
+### Solved: the composer connects display 0 only after all three callbacks
+
+`--lifecycle` showed that no ordinary display call (`getDisplayType`,
+`getDisplayName`, `setPowerMode`, `getActiveConfig`, `getDisplayAttribute`)
+connects display 0; they all answer `BAD_DISPLAY`. Reading the vendor composer
+found why. `HWCMediator::deviceRegisterCallback` (0x67638) stores the three
+callback pointers at `[this+0x130]` (hotplug), `[this+0x140]` (vsync) and
+`[this+0x150]` (refresh), and only the *shared tail* at 0x679e0 — reached by all
+three branches — checks that all of them are non-null and `[this+0x12c] == 0`,
+then builds DisplayManager's 0x98-byte forwarding listener, `setListener()`s it
+and calls `DisplayManager::init()` (0x85208). `init()` is what fills in the
+display table (and calls the listener's `onHotPlugExt(0, connected=1)`, i.e. the
+client hotplug callback, synchronously on the registering thread).
+
+So registering hotplug alone leaves the display table empty forever, and
+`getDisplayConfigs(0)` returns `BAD_DISPLAY`. Registering vsync and refresh
+first, then hotplug, fixes it — measured with the probe:
+
+```
+register: vsync -> 0
+register: refresh -> 0
+hotplug : display=0 state=1 tid=11842
+register: hotplug -> 0
+register: connected_right_after=1 callbacks=1
+configs : display=0 -> 0, 2 config(s)
+```
+
+`gralloc1-probe --hotplug` now registers all three (and `--only-hotplug`
+reproduces the old single-callback run), and
+`patches/bootable/recovery/0002-mali-register-all-hwc-callbacks.patch` does the
+same in `mali_display.cpp`: two no-op vsync/refresh callbacks, registered before
+hotplug, then the existing `connected` check passes.
+
+### Patching the Mali backend
+
+The backend lives in `bootable/recovery` on apkreader's `mali-testing` branch,
+which is not ours to push to, so fixes are patches in this repo:
+
+```
+patches/<project path>/NNNN-name.patch     e.g. patches/bootable/recovery/0001-*.patch
+```
+
+`build-aera.yml` applies them in the "Apply local patches" step, right after the
+branch switch and the device tree copy. Every patch is `git apply --check`ed
+first and the step fails immediately on a context mismatch — the failure mode to
+avoid is a two-and-a-half-hour build that silently ships without the fix. A
+patch-only change does trigger an image build (`patches/**` is in the workflow's
+`paths`), because nothing else can apply it.
+
+Generate them from the exact upstream file rather than by hand: a unified diff
+produced by `difflib` against a byte-identical copy of the file at the pinned
+commit always applies, and hand-written hunk headers usually do not.
 
 
 ### What is shipped

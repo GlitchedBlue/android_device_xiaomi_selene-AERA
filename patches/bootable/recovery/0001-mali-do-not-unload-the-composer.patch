@@ -1,0 +1,22 @@
+--- a/aeraui/core/mali_display.cpp
++++ b/aeraui/core/mali_display.cpp
+@@ -131,7 +131,18 @@
+       if (buffers[i] && release) release(allocator, buffers[i]);
+     }
+     if (allocator) gralloc1_close(allocator);
+-    if (composer_library) dlclose(composer_library);
++    // The composer is deliberately never unloaded. Its destructors are the one
++    // part of this vendor stack that cannot run under Android 16: MTK's Android
++    // 12 ~AsyncBlitDevice frees a pointer the newer allocator rejects, and the
++    // abort turns any failed Initialize() into a recovery crash loop.
++    //
++    //   I hwcomposer: [ASYNCBLTDEV] ~AsyncBlitDevice
++    //   I scudo     : Scudo ERROR: misaligned pointer when deallocating 0x...
++    //
++    // dlclose() buys nothing here -- this object dies with the process -- and
++    // keeping the handle means the module stays mapped, so the vendor's static
++    // destructors simply never run. If the composer is ever reloaded, dlopen()
++    // hands back the same handle.
+     if (allocator_library) dlclose(allocator_library);
+     if (driver_library) dlclose(driver_library);
+     if (linker_library) dlclose(linker_library);
