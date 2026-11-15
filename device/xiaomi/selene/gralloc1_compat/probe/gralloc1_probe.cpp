@@ -791,6 +791,10 @@ constexpr uint64_t kProbeNativeUsage = GRALLOC_USAGE_HW_RENDER |
 #define EGL_DMA_BUF_PLANE0_OFFSET_EXT 0x3273
 #define EGL_DMA_BUF_PLANE0_PITCH_EXT 0x3274
 #endif
+#ifndef EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT
+#define EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT 0x3443
+#define EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT 0x3444
+#endif
 #ifndef DRM_FORMAT_ABGR8888
 // HAL_PIXEL_FORMAT_RGBA_8888 keeps R,G,B,A in ascending addresses, which is DRM's
 // "ABGR8888" (0xAABBGGRR read as a little-endian word).
@@ -823,6 +827,43 @@ bool LoadGlSymbol(void* library, PFNEGLGETPROCADDRESSPROC get_proc_address,
   if (*out == nullptr) printf("gles    : no %s\n", name);
   return *out != nullptr;
 }
+
+// One dma-buf import attempt. ARM reports an unsupported format or pitch as
+// EGL_BAD_MATCH, so the caller varies the fourcc and the modifier to find a
+// combination the driver accepts.
+EGLImageKHR TryDmaBufImport(PFNEGLCREATEIMAGEKHRPROC create_image,
+                            EGLDisplay display, int fd, uint32_t width,
+                            uint32_t height, uint32_t stride_pixels,
+                            uint32_t fourcc, bool with_modifier) {
+  EGLint attributes[32] = {};
+  int at = 0;
+  attributes[at++] = EGL_WIDTH;
+  attributes[at++] = static_cast<EGLint>(width);
+  attributes[at++] = EGL_HEIGHT;
+  attributes[at++] = static_cast<EGLint>(height);
+  attributes[at++] = EGL_LINUX_DRM_FOURCC_EXT;
+  attributes[at++] = static_cast<EGLint>(fourcc);
+  attributes[at++] = EGL_DMA_BUF_PLANE0_FD_EXT;
+  attributes[at++] = fd;
+  attributes[at++] = EGL_DMA_BUF_PLANE0_OFFSET_EXT;
+  attributes[at++] = 0;
+  attributes[at++] = EGL_DMA_BUF_PLANE0_PITCH_EXT;
+  attributes[at++] = static_cast<EGLint>(stride_pixels * 4);
+  if (with_modifier) {
+    attributes[at++] = EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT;
+    attributes[at++] = 0;  // DRM_FORMAT_MOD_LINEAR
+    attributes[at++] = EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT;
+    attributes[at++] = 0;
+  }
+  attributes[at++] = EGL_NONE;
+  return create_image(display, EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT, nullptr,
+                      attributes);
+}
+
+struct DmaBufFormat {
+  uint32_t fourcc;
+  const char* name;
+};
 
 int RunEglProbe(const char* driver_path, const char* shim_path, uint32_t width,
                 uint32_t height, bool use_native) {
@@ -1031,22 +1072,16 @@ int RunEglProbe(const char* driver_path, const char* shim_path, uint32_t width,
   gl_gen_textures(2, textures);
   gl_gen_framebuffers(2, framebuffers);
 
-  auto import_dmabuf = [&](int fd, uint32_t stride_pixels) -> EGLImageKHR {
-    const EGLint attributes[] = {
-        EGL_WIDTH, static_cast<EGLint>(width),
-        EGL_HEIGHT, static_cast<EGLint>(height),
-        EGL_LINUX_DRM_FOURCC_EXT, DRM_FORMAT_ABGR8888,
-        EGL_DMA_BUF_PLANE0_FD_EXT, fd,
-        EGL_DMA_BUF_PLANE0_OFFSET_EXT, 0,
-        EGL_DMA_BUF_PLANE0_PITCH_EXT, static_cast<EGLint>(stride_pixels * 4),
-        EGL_NONE,
-    };
-    return create_image(display, EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT, nullptr,
-                        attributes);
+  static const DmaBufFormat kFormats[] = {
+      {0x52474241u, "ABGR8888"},  // HAL_PIXEL_FORMAT_RGBA_8888
+      {0x34325241u, "ARGB8888"},
+      {0x34324258u, "XBGR8888"},
+      {0x34325258u, "XRGB8888"},
   };
-
   int failures = 0;
   int fd_index = -1;
+  int format_index = 0;
+  bool use_modifier = false;
   for (int i = 0; i < 2; ++i) {
     printf("buffer %d: fds=%d ints=%d stride=%u\n", i, buffers[i]->numFds,
            buffers[i]->numInts, strides[i]);
@@ -1077,17 +1112,51 @@ int RunEglProbe(const char* driver_path, const char* shim_path, uint32_t width,
              images[i] == EGL_NO_IMAGE_KHR ? get_error() : 0);
     } else {
       // The handle carries more than one descriptor, so find the one that is
-      // actually the dma-buf rather than assuming an order. The index found for
-      // buffer 0 is reused for buffer 1.
-      const int first = fd_index >= 0 ? fd_index : 0;
-      const int last = fd_index >= 0 ? fd_index : buffers[i]->numFds - 1;
-      for (int k = first; k <= last && images[i] == EGL_NO_IMAGE_KHR; ++k) {
-        const int fd = buffers[i]->data[k];
-        images[i] = import_dmabuf(fd, strides[i]);
-        const EGLint error = images[i] == EGL_NO_IMAGE_KHR ? get_error() : 0;
-        printf("image %d : fd[%d]=%d -> %s (error %#x)\n", i, k, fd,
-               images[i] == EGL_NO_IMAGE_KHR ? "failed" : "ok", error);
-        if (images[i] != EGL_NO_IMAGE_KHR) fd_index = k;
+      // actually the dma-buf rather than assuming an order, and print what the
+      // kernel says each one is.
+      if (i == 0) {
+        for (int k = 0; k < buffers[i]->numFds; ++k) {
+          const int fd = buffers[i]->data[k];
+          if (fd < 0) continue;
+          char path[32];
+          char link[128] = {};
+          snprintf(path, sizeof(path), "/proc/self/fd/%d", fd);
+          const ssize_t linked = readlink(path, link, sizeof(link) - 1);
+          printf("image %d : fd[%d]=%d -> %s\n", i, k, fd,
+                 linked > 0 ? link : "(unreadable)");
+        }
+        // Only the first buffer explores the fourcc/modifier matrix; the second
+        // reuses whatever worked so the log stays readable.
+        for (int k = 0; k < buffers[i]->numFds && images[i] == EGL_NO_IMAGE_KHR;
+             ++k) {
+          const int fd = buffers[i]->data[k];
+          if (fd < 0) continue;
+          for (int f = 0; f < 4 && images[i] == EGL_NO_IMAGE_KHR; ++f) {
+            for (int m = 0; m < 2 && images[i] == EGL_NO_IMAGE_KHR; ++m) {
+              images[i] = TryDmaBufImport(create_image, display, fd, width, height,
+                                          strides[i], kFormats[f].fourcc, m != 0);
+              const EGLint error =
+                  images[i] == EGL_NO_IMAGE_KHR ? get_error() : 0;
+              printf("image %d : %s %s -> %s (error %#x)\n", i, kFormats[f].name,
+                     m != 0 ? "+modifier" : "",
+                     images[i] == EGL_NO_IMAGE_KHR ? "failed" : "ok", error);
+              if (images[i] != EGL_NO_IMAGE_KHR) {
+                fd_index = k;
+                format_index = f;
+                use_modifier = m != 0;
+              }
+            }
+          }
+        }
+      } else if (fd_index >= 0) {
+        const int fd = buffers[i]->data[fd_index];
+        images[i] = TryDmaBufImport(create_image, display, fd, width, height,
+                                    strides[i], kFormats[format_index].fourcc,
+                                    use_modifier);
+        printf("image %d : fd[%d]=%d %s -> %s (error %#x)\n", i, fd_index, fd,
+               kFormats[format_index].name,
+               images[i] == EGL_NO_IMAGE_KHR ? "failed" : "ok",
+               images[i] == EGL_NO_IMAGE_KHR ? get_error() : 0);
       }
     }
     if (images[i] == EGL_NO_IMAGE_KHR) {
