@@ -18,6 +18,7 @@ unmodified, Apache-2.0:
 | `hardware/gralloc1.h` | same |
 | `hardware/fb.h` | same (included by `gralloc.h`) |
 | `hardware/hwcomposer2.h` | same (the probe's `--hwc`/`--hotplug` modes) |
+| `hardware/hwcomposer_defs.h` | same (included by `hwcomposer2.h`) |
 | `cutils/native_handle.h` | `platform/system/core`, `libcutils/include/cutils/` |
 | `system/graphics.h` | `platform/system/core`, `libsystem/include/system/` |
 | `system/graphics-base.h` | same (included by `graphics.h`) |
