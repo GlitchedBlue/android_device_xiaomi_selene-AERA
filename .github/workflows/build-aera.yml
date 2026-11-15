@@ -37,6 +37,12 @@ on:
       - aera-16.0
     paths:
       - 'device/**'
+      # The gralloc1 shim has its own minute-long workflow
+      # (.github/workflows/gralloc1-shim.yml). It is staged into the blob store
+      # on the rescue partition and loaded through ro.aera.gpu.gralloc, so it is
+      # not part of the ramdisk: an image build only re-validates it. Editing it
+      # alone must not cost two and a half hours.
+      - '!device/xiaomi/selene/gralloc1_compat/**'
       - '.github/workflows/build-aera.yml'
 
 concurrency:
@@ -334,12 +340,16 @@ jobs:
             exit 1
           fi
           # dlsym(HAL_MODULE_INFO_SYM_AS_STR) is how mali_display.cpp finds the
-          # module, so a hidden symbol would make the HAL invisible.
-          if ! readelf -sW "${GRALLOC}" | grep -q ' HAL_MODULE_INFO_SYM$'; then
-            echo "::error::libaera_gralloc1.so does not export HAL_MODULE_INFO_SYM"
-            readelf -sW "${GRALLOC}" | tail -20 || true
+          # module, so a hidden symbol would make the HAL invisible. Note the
+          # name: hardware.h defines HAL_MODULE_INFO_SYM as HMI, and
+          # HAL_MODULE_INFO_SYM_AS_STR as "HMI" -- grepping for the macro name
+          # matches nothing at all.
+          if ! readelf --dyn-syms -W "${GRALLOC}" | grep -qE 'OBJECT +GLOBAL +DEFAULT +[0-9]+ HMI$'; then
+            echo "::error::libaera_gralloc1.so does not export HMI (HAL_MODULE_INFO_SYM)"
+            readelf --dyn-syms -W "${GRALLOC}" || true
             exit 1
           fi
+          echo "exported: $(readelf --dyn-syms -W "${GRALLOC}" | grep -E 'OBJECT +GLOBAL +DEFAULT +[0-9]+ HMI$')"
           # The private namespace is linked to the recovery process for exactly
           # libc/libm/libdl. Any other DT_NEEDED would have to be staged into
           # the blob store as well, so fail loudly instead of shipping a shim

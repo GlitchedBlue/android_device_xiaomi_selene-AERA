@@ -92,8 +92,16 @@ jobs:
           so=artifacts/gralloc.mt6768.so
           readelf -hW "$so" | grep -q 'AArch64' \
             || { echo "::error::$so is not an AArch64 object"; readelf -hW "$so"; exit 1; }
-          readelf -sW "$so" | grep -q ' HAL_MODULE_INFO_SYM$' \
-            || { echo "::error::$so does not export HAL_MODULE_INFO_SYM"; readelf -sW "$so" | tail -30; exit 1; }
+          # hardware.h defines HAL_MODULE_INFO_SYM as HMI, and
+          # HAL_MODULE_INFO_SYM_AS_STR as "HMI", which is the name
+          # mali_display.cpp passes to dlsym(). Grepping for the macro name
+          # matches nothing.
+          if ! readelf --dyn-syms -W "$so" | grep -qE 'OBJECT +GLOBAL +DEFAULT +[0-9]+ HMI$'; then
+            echo "::error::$so does not export HMI (HAL_MODULE_INFO_SYM)"
+            readelf --dyn-syms -W "$so" || true
+            exit 1
+          fi
+          echo "exported: $(readelf --dyn-syms -W "$so" | grep -E 'OBJECT +GLOBAL +DEFAULT +[0-9]+ HMI$')"
           unexpected=$(readelf -dW "$so" | grep NEEDED | grep -Ev 'libc\.so|libm\.so|libdl\.so' || true)
           if [ -n "$unexpected" ]; then
             echo "::error::$so depends on a library the Mali namespace does not share"
