@@ -50,8 +50,11 @@
 //   +0x58  size             (u64; derive writes it, allocator_allocate reads it
 //                            as the ION allocation length)
 //   +0x68  internal_format  (u64; select_format's return value)
-//   +0x74  byte_stride
-//   +0x78  pixel_stride     (gralloc1 GET_STRIDE wants this one)
+//   +0x74  pixel_stride     (16-pixel aligned width: 1081 -> 1088,
+//                            1440 -> 1440; this is what GET_STRIDE reports)
+//   +0x78  aligned height   (not a stride: 1081x100 -> 100, 1440x3200 -> 3200.
+//                            Measuring this on the device is what corrected the
+//                            original guess, which had 0x74/0x78 swapped.)
 //
 // The descriptor is therefore handed over as an opaque zeroed byte buffer with
 // these fields poked in, which avoids re-declaring a struct whose full layout
@@ -100,8 +103,11 @@ constexpr size_t kLayerCountOff = 0x28;
 constexpr size_t kFormatTypeOff = 0x34;
 constexpr size_t kSizeOff = 0x58;
 constexpr size_t kInternalFormatOff = 0x68;
-constexpr size_t kByteStrideOff = 0x74;
-constexpr size_t kPixelStrideOff = 0x78;
+// 0x74 is the pixel stride (16-pixel aligned width), 0x78 is the height. The
+// first probe run on the device showed 1081x100 -> stride 1088, height 100 and
+// 1440x3200 -> stride 1440, height 3200, which is what settled the order.
+constexpr size_t kPixelStrideOff = 0x74;
+constexpr size_t kAlignedHeightOff = 0x78;
 
 // The highest offset the vendor code touches is 0xac; leave plenty of room so
 // a slightly larger struct in a future build cannot scribble past our buffer.
@@ -269,23 +275,23 @@ bool TryAllocate(const Descriptor& source, void** handle, uint32_t* stride,
   void* result = nullptr;
   int error = g_allocator.allocate(&descriptor, &result);
   Log("allocate %s: format_type=%d layer_count=%d -> error=%d handle=%p "
-      "size=%llu internal_format=%#llx byte_stride=%d pixel_stride=%d",
+      "size=%llu internal_format=%#llx stride=%d height=%d",
       reason, format_type, layer_count, error, result,
       static_cast<unsigned long long>(descriptor.Get64(kSizeOff)),
       static_cast<unsigned long long>(descriptor.Get64(kInternalFormatOff)),
-      static_cast<int>(descriptor.Get32(kByteStrideOff)),
-      static_cast<int>(descriptor.Get32(kPixelStrideOff)));
+      static_cast<int>(descriptor.Get32(kPixelStrideOff)),
+      static_cast<int>(descriptor.Get32(kAlignedHeightOff)));
   if (error != 0 || result == nullptr) return false;
 
   uint32_t pixel_stride = descriptor.Get32(kPixelStrideOff);
-  uint32_t byte_stride = descriptor.Get32(kByteStrideOff);
   uint32_t width = source.Get32(kWidthOff);
-  // GET_STRIDE is in pixels. If the vendor left pixel_stride empty, fall back
-  // to the width rather than to byte_stride (which is 4x for RGBA_8888).
+  // GET_STRIDE is in pixels. 0x74 is already the 16-pixel aligned width
+  // (1081 -> 1088), so it is normally >= width; fall back to width if the
+  // vendor ever leaves it empty.
   *stride = pixel_stride >= width ? pixel_stride : width;
-  if (byte_stride != 0 && byte_stride != *stride) {
-    Log("note: byte_stride=%u pixel_stride=%u width=%u (using %u)", byte_stride,
-        pixel_stride, width, *stride);
+  if (pixel_stride < width) {
+    Log("note: vendor left stride at %u for width %u (using %u)", pixel_stride,
+        width, *stride);
   }
   *handle = result;
   return true;
