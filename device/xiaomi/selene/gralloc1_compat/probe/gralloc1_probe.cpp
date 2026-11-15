@@ -53,7 +53,6 @@
 #include <android/dlext.h>
 #include <dlfcn.h>
 #include <errno.h>
-#include <execinfo.h>
 #include <malloc.h>
 #include <poll.h>
 #include <signal.h>
@@ -677,10 +676,16 @@ int RunPresentProbe(const char* hwc_path, const char* shim_path, uint32_t width,
 // but "Segmentation fault". This handler prints the faulting address and a
 // backtrace resolved to library+offset, which is enough to find the code in the
 // blob with a disassembler.
+//
+// backtrace() is declared by hand: bionic exports it, but the NDK only ships
+// <execinfo.h> for newer API levels, and the symbol is weak here so an old
+// libc degrades to the faulting PC instead of failing to load.
+extern "C" int backtrace(void**, int) __attribute__((weak));
+
 void CrashHandler(int signal, siginfo_t* info, void* context) {
   char line[512];
   void* frames[40];
-  const int count = backtrace(frames, 40);
+  const int count = backtrace != nullptr ? backtrace(frames, 40) : 0;
   uintptr_t pc = 0;
   if (context != nullptr) {
     auto* uc = static_cast<ucontext_t*>(context);
