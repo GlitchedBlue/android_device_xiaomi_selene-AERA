@@ -22,6 +22,12 @@
 //   LD_LIBRARY_PATH=/gpu/lib64:/vendor/lib64:/system/lib64 \
 //     /data/local/tmp/gralloc1-probe [shim.so] [width] [height]
 //
+//   LD_LIBRARY_PATH=/gpu/lib64:/vendor/lib64:/system/lib64 \
+//     /data/local/tmp/gralloc1-probe --hwc [hwcomposer.mt6768.so]
+//
+// The second form is the crash-loop test: it opens and closes the vendor HWC2
+// module without recovery being involved.
+//
 // LD_LIBRARY_PATH must contain the staged Android 12 libraries, because the
 // shim dlopens the vendor allocator impl, whose own DT_NEEDED (libhidlbase,
 // libion, libdrm, ...) have to resolve to the vendor copies.
@@ -29,6 +35,7 @@
 #include <dlfcn.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include <hardware/gralloc1.h>
 #include <hardware/hardware.h>
@@ -66,9 +73,54 @@ void PrintShimLog() {
     return 1;                                                           \
   }
 
+// --hwc: load the vendor HWC2 module and open/close it the way
+// mali_display.cpp does at the end of Initialize() and in ~Impl(). That is the
+// sequence that aborted recovery (an Android 12 destructor freeing a pointer
+// whose top-byte tag Android 16's bionic rejects), so running it in a throwaway
+// process says whether the crash loop is still waiting before recovery has to
+// find out the hard way.
+int RunHwcProbe(const char* path) {
+  printf("hwc     : %s\n", path);
+  void* library = dlopen(path, RTLD_NOW);
+  if (library == nullptr) {
+    printf("dlopen  : %s\n", dlerror());
+    return 1;
+  }
+  auto* module = static_cast<hw_module_t*>(dlsym(library, HAL_MODULE_INFO_SYM_AS_STR));
+  if (module == nullptr) {
+    printf("dlsym   : %s not found: %s\n", HAL_MODULE_INFO_SYM_AS_STR, dlerror());
+    return 1;
+  }
+  printf("module  : %s (by %s)\n", module->name, module->author);
+  if (module->methods == nullptr || module->methods->open == nullptr) {
+    printf("no methods->open\n");
+    return 1;
+  }
+  hw_device_t* device = nullptr;
+  // mali_display.cpp passes HWC_HARDWARE_COMPOSER. Spelled out so the probe
+  // does not need hardware/hwcomposer.h.
+  const int rc = module->methods->open(module, "composer", &device);
+  printf("open    : %d device=%p\n", rc, static_cast<void*>(device));
+  if (rc != 0 || device == nullptr) {
+    printf("hwcomposer open failed\n");
+    return 1;
+  }
+  printf("version : %#x (HWC2: %s)\n", device->common.version,
+         (device->common.version >> 24) == 2 ? "yes" : "NO");
+  printf("close   : %d\n", device->common.close(device));
+  printf("dlclose : %d\n", dlclose(library));
+  printf("survived the destructor path\n");
+  return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
+  if (argc > 1 && strcmp(argv[1], "--hwc") == 0) {
+    return RunHwcProbe(argc > 2 ? argv[2]
+                                : "/gpu/stock-vendor/lib64/hw/hwcomposer.mt6768.so");
+  }
+
   const char* path = argc > 1 ? argv[1]
                               : "/gpu-rescue/aera-gpu/vendor/lib64/hw/gralloc.mt6768.so";
   const uint32_t width = argc > 2 ? static_cast<uint32_t>(strtoul(argv[2], nullptr, 0)) : 1080;
