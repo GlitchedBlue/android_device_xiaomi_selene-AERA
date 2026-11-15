@@ -582,10 +582,11 @@ int RunPresentProbe(const char* hwc_path, const char* shim_path, uint32_t width,
   if (layer_rc) return 1;
 
   const hwc_rect_t frame{0, 0, static_cast<int32_t>(width), static_cast<int32_t>(height)};
+  const hwc_frect_t crop{0.0f, 0.0f, static_cast<float>(width), static_cast<float>(height)};
   printf("layer   : composition -> %d\n",
          SET_LAYER_COMPOSITION_TYPE(device, display, layer, HWC2_COMPOSITION_CLIENT));
   printf("layer   : frame -> %d\n", SET_LAYER_DISPLAY_FRAME(device, display, layer, frame));
-  printf("layer   : crop -> %d\n", SET_LAYER_SOURCE_CROP(device, display, layer, frame));
+  printf("layer   : crop -> %d\n", SET_LAYER_SOURCE_CROP(device, display, layer, crop));
   printf("layer   : blend -> %d\n",
          SET_LAYER_BLEND_MODE(device, display, layer, HWC2_BLEND_MODE_NONE));
   printf("layer   : alpha -> %d\n",
