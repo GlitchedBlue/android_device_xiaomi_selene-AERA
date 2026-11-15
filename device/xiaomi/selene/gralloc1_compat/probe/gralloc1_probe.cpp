@@ -31,6 +31,9 @@
 //   LD_LIBRARY_PATH=/gpu/lib64:/vendor/lib64:/system/lib64 \
 //     /data/local/tmp/gralloc1-probe --lifecycle [--no-teardown]
 //
+//   LD_LIBRARY_PATH=/gpu/lib64:/vendor/lib64:/system/lib64 \
+//     /data/local/tmp/gralloc1-probe --present [hwcomposer.so] [gralloc.so] [w] [h]
+//
 // The second form is the crash-loop test: it opens and closes the vendor HWC2
 // module without recovery being involved. The third registers the hotplug
 // callback, waits for it, and asks the composer about displays 0..3, which is
@@ -428,6 +431,205 @@ int RunLifecycleProbe(const char* path, bool teardown) {
   return 0;
 }
 
+// ---------------------------------------------------------------------------
+// --present: the rest of Initialize() and one Present()
+// ---------------------------------------------------------------------------
+// --hotplug settled display discovery. This walks what mali_display.cpp does
+// next, in the same order: setPowerMode(ON), createLayer, the layer properties,
+// setClientTarget with a real shim-allocated buffer, validateDisplay,
+// acceptDisplayChanges, presentDisplay, getReleaseFences. Every one of those can
+// fail on its own, and each failure otherwise costs a two-and-a-half-hour image
+// build to discover.
+bool AllocateScanout(const char* shim_path, uint32_t width, uint32_t height,
+                     buffer_handle_t* out, gralloc1_device_t** out_device) {
+  void* library = dlopen(shim_path, RTLD_NOW);
+  if (library == nullptr) {
+    printf("shim    : dlopen failed: %s\n", dlerror());
+    return false;
+  }
+  auto* module = static_cast<hw_module_t*>(dlsym(library, HAL_MODULE_INFO_SYM_AS_STR));
+  if (module == nullptr) {
+    printf("shim    : %s not found: %s\n", HAL_MODULE_INFO_SYM_AS_STR, dlerror());
+    return false;
+  }
+  gralloc1_device_t* device = nullptr;
+  if (gralloc1_open(module, &device) != 0 || device == nullptr || !device->getFunction) {
+    printf("shim    : gralloc1_open failed\n");
+    return false;
+  }
+  // The file-scope LOOKUP returns 1 on failure, which is the opposite of this
+  // function's convention, so it gets its own.
+#define SHIM(type, name)                                                  \
+  auto name = reinterpret_cast<type>(                                     \
+      device->getFunction(device, GRALLOC1_FUNCTION_##name));              \
+  if (name == nullptr) {                                                  \
+    printf("shim    : getFunction(%s) returned null\n", #name);            \
+    return false;                                                         \
+  }
+  SHIM(GRALLOC1_PFN_CREATE_DESCRIPTOR, CREATE_DESCRIPTOR);
+  SHIM(GRALLOC1_PFN_DESTROY_DESCRIPTOR, DESTROY_DESCRIPTOR);
+  SHIM(GRALLOC1_PFN_SET_DIMENSIONS, SET_DIMENSIONS);
+  SHIM(GRALLOC1_PFN_SET_FORMAT, SET_FORMAT);
+  SHIM(GRALLOC1_PFN_SET_PRODUCER_USAGE, SET_PRODUCER_USAGE);
+  SHIM(GRALLOC1_PFN_SET_CONSUMER_USAGE, SET_CONSUMER_USAGE);
+  SHIM(GRALLOC1_PFN_ALLOCATE, ALLOCATE);
+  SHIM(GRALLOC1_PFN_GET_STRIDE, GET_STRIDE);
+#undef SHIM
+
+  gralloc1_buffer_descriptor_t descriptor = 0;
+  if (CREATE_DESCRIPTOR(device, &descriptor) != GRALLOC1_ERROR_NONE) {
+    printf("shim    : create descriptor failed\n");
+    return false;
+  }
+  const bool configured =
+      SET_DIMENSIONS(device, descriptor, width, height) == 0 &&
+      SET_FORMAT(device, descriptor, HAL_PIXEL_FORMAT_RGBA_8888) == 0 &&
+      SET_PRODUCER_USAGE(device, descriptor, kProducerUsage) == 0 &&
+      SET_CONSUMER_USAGE(device, descriptor, kConsumerUsage) == 0;
+  if (!configured) {
+    printf("shim    : descriptor configuration failed\n");
+    DESTROY_DESCRIPTOR(device, descriptor);
+    return false;
+  }
+  const int rc = ALLOCATE(device, 1, &descriptor, out);
+  uint32_t stride = 0;
+  if (rc == GRALLOC1_ERROR_NONE && *out != nullptr) GET_STRIDE(device, *out, &stride);
+  DESTROY_DESCRIPTOR(device, descriptor);
+  printf("shim    : allocate -> %d handle=%p stride=%u\n", rc, static_cast<const void*>(*out),
+         stride);
+  *out_device = device;
+  return rc == GRALLOC1_ERROR_NONE && *out != nullptr;
+}
+
+int RunPresentProbe(const char* hwc_path, const char* shim_path, uint32_t width,
+                    uint32_t height) {
+  printf("hwc     : %s\n", hwc_path);
+  void* library = dlopen(hwc_path, RTLD_NOW);
+  if (library == nullptr) {
+    printf("dlopen  : %s\n", dlerror());
+    return 1;
+  }
+  auto* module = static_cast<hw_module_t*>(dlsym(library, HAL_MODULE_INFO_SYM_AS_STR));
+  if (module == nullptr || module->methods == nullptr || module->methods->open == nullptr) {
+    printf("dlsym/open: %s\n", module == nullptr ? dlerror() : "no methods->open");
+    return 1;
+  }
+  hw_device_t* base = nullptr;
+  if (module->methods->open(module, "composer", &base) != 0 || base == nullptr) {
+    printf("hwcomposer open failed\n");
+    return 1;
+  }
+  auto* device = reinterpret_cast<hwc2_device_t*>(base);
+
+#define COMPOSER(type, name)                                                   \
+  auto name = reinterpret_cast<type>(                                          \
+      device->getFunction(device, HWC2_FUNCTION_##name));                       \
+  if (name == nullptr) {                                                       \
+    printf("no HWC2 function %s\n", #name);                                     \
+    return 1;                                                                  \
+  }
+  COMPOSER(HWC2_PFN_REGISTER_CALLBACK, REGISTER_CALLBACK);
+  COMPOSER(HWC2_PFN_SET_POWER_MODE, SET_POWER_MODE);
+  COMPOSER(HWC2_PFN_CREATE_LAYER, CREATE_LAYER);
+  COMPOSER(HWC2_PFN_SET_LAYER_COMPOSITION_TYPE, SET_LAYER_COMPOSITION_TYPE);
+  COMPOSER(HWC2_PFN_SET_LAYER_DISPLAY_FRAME, SET_LAYER_DISPLAY_FRAME);
+  COMPOSER(HWC2_PFN_SET_LAYER_SOURCE_CROP, SET_LAYER_SOURCE_CROP);
+  COMPOSER(HWC2_PFN_SET_LAYER_BLEND_MODE, SET_LAYER_BLEND_MODE);
+  COMPOSER(HWC2_PFN_SET_LAYER_PLANE_ALPHA, SET_LAYER_PLANE_ALPHA);
+  COMPOSER(HWC2_PFN_SET_CLIENT_TARGET, SET_CLIENT_TARGET);
+  COMPOSER(HWC2_PFN_VALIDATE_DISPLAY, VALIDATE_DISPLAY);
+  COMPOSER(HWC2_PFN_ACCEPT_DISPLAY_CHANGES, ACCEPT_DISPLAY_CHANGES);
+  COMPOSER(HWC2_PFN_PRESENT_DISPLAY, PRESENT_DISPLAY);
+  COMPOSER(HWC2_PFN_GET_RELEASE_FENCES, GET_RELEASE_FENCES);
+  COMPOSER(HWC2_PFN_GET_DISPLAY_CONFIGS, GET_DISPLAY_CONFIGS);
+  COMPOSER(HWC2_PFN_GET_ACTIVE_CONFIG, GET_ACTIVE_CONFIG);
+  COMPOSER(HWC2_PFN_GET_DISPLAY_ATTRIBUTE, GET_DISPLAY_ATTRIBUTE);
+#undef COMPOSER
+
+  if (REGISTER_CALLBACK(device, HWC2_CALLBACK_VSYNC, nullptr,
+                        reinterpret_cast<hwc2_function_pointer_t>(VsyncCallback)) ||
+      REGISTER_CALLBACK(device, HWC2_CALLBACK_REFRESH, nullptr,
+                        reinterpret_cast<hwc2_function_pointer_t>(RefreshCallback)) ||
+      REGISTER_CALLBACK(device, HWC2_CALLBACK_HOTPLUG, nullptr,
+                        reinterpret_cast<hwc2_function_pointer_t>(HotplugCallback))) {
+    printf("callback registration failed\n");
+    return 1;
+  }
+  if (!__atomic_load_n(&g_hotplug_connected, __ATOMIC_SEQ_CST)) {
+    printf("display : not connected after registration\n");
+    return 1;
+  }
+  const hwc2_display_t display =
+      __atomic_load_n(&g_hotplug_display, __ATOMIC_SEQ_CST);
+
+  uint32_t config_count = 0;
+  const int config_rc = GET_DISPLAY_CONFIGS(device, display, &config_count, nullptr);
+  hwc2_config_t active = 0;
+  const int active_rc = GET_ACTIVE_CONFIG(device, display, &active);
+  printf("config  : getDisplayConfigs -> %d (%u), getActiveConfig -> %d (%u)\n",
+         config_rc, config_count, active_rc, active);
+  for (int32_t which = 0; which <= 4; ++which) {
+    int32_t value = -1;
+    const int rc = GET_DISPLAY_ATTRIBUTE(device, display, active, which, &value);
+    printf("attr    : %d -> %d value=%d\n", which, rc, value);
+  }
+
+  printf("power   : %d\n", SET_POWER_MODE(device, display, HWC2_POWER_MODE_ON));
+  hwc2_layer_t layer = 0;
+  const int layer_rc = CREATE_LAYER(device, display, &layer);
+  printf("layer   : create -> %d id=%llu\n", layer_rc,
+         static_cast<unsigned long long>(layer));
+  if (layer_rc) return 1;
+
+  const hwc_rect_t frame{0, 0, static_cast<int32_t>(width), static_cast<int32_t>(height)};
+  printf("layer   : composition -> %d\n",
+         SET_LAYER_COMPOSITION_TYPE(device, display, layer, HWC2_COMPOSITION_CLIENT));
+  printf("layer   : frame -> %d\n", SET_LAYER_DISPLAY_FRAME(device, display, layer, frame));
+  printf("layer   : crop -> %d\n", SET_LAYER_SOURCE_CROP(device, display, layer, frame));
+  printf("layer   : blend -> %d\n",
+         SET_LAYER_BLEND_MODE(device, display, layer, HWC2_BLEND_MODE_NONE));
+  printf("layer   : alpha -> %d\n",
+         SET_LAYER_PLANE_ALPHA(device, display, layer, 1.0f));
+
+  buffer_handle_t buffer = nullptr;
+  gralloc1_device_t* allocator = nullptr;
+  if (!AllocateScanout(shim_path, width, height, &buffer, &allocator)) return 1;
+
+  const hwc_region_t damage{1, &frame};
+  const int target_rc = SET_CLIENT_TARGET(device, display, buffer, -1, 0, damage);
+  printf("target  : %d\n", target_rc);
+
+  uint32_t types = 0, requests = 0;
+  int result = VALIDATE_DISPLAY(device, display, &types, &requests);
+  printf("validate: %d types=%u requests=%u\n", result, types, requests);
+  if (result == HWC2_ERROR_HAS_CHANGES) {
+    result = ACCEPT_DISPLAY_CHANGES(device, display);
+    printf("accept  : %d\n", result);
+  }
+  int fence = -1;
+  const int present_rc = PRESENT_DISPLAY(device, display, &fence);
+  printf("present : %d fence=%d\n", present_rc, fence);
+
+  uint32_t fence_count = 0;
+  const int fences_rc = GET_RELEASE_FENCES(device, display, &fence_count, nullptr, nullptr);
+  printf("fences  : %d count=%u\n", fences_rc, fence_count);
+  if (fences_rc == 0 && fence_count > 0 && fence_count <= 16) {
+    hwc2_layer_t layers[16] = {};
+    int32_t fds[16] = {};
+    const int rc = GET_RELEASE_FENCES(device, display, &fence_count, layers, fds);
+    printf("fences  : second call -> %d\n", rc);
+    for (uint32_t i = 0; i < fence_count; ++i) {
+      printf("          layer=%llu fd=%d\n", static_cast<unsigned long long>(layers[i]),
+             fds[i]);
+      if (fds[i] >= 0) close(fds[i]);
+    }
+  }
+  if (fence >= 0) close(fence);
+
+  printf("teardown: skipped (deliberately; the composer is never unloaded)\n");
+  return present_rc == 0 ? 0 : 1;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -464,6 +666,23 @@ int main(int argc, char** argv) {
       if (strncmp(argv[i], "--", 2) != 0) hwc_path = argv[i];
     }
     return RunHwcProbe(hwc_path);
+  }
+
+  if (argc > 1 && strcmp(argv[1], "--present") == 0) {
+    const char* hwc_path = "/gpu/stock-vendor/lib64/hw/hwcomposer.mt6768.so";
+    const char* shim_path = "/gpu/stock-vendor/lib64/hw/gralloc.mt6768.so";
+    uint32_t width = 1080;
+    uint32_t height = 2400;
+    int positional = 0;
+    for (int i = 2; i < argc; ++i) {
+      if (strncmp(argv[i], "--", 2) == 0) continue;
+      if (positional == 0) hwc_path = argv[i];
+      else if (positional == 1) shim_path = argv[i];
+      else if (positional == 2) width = static_cast<uint32_t>(strtoul(argv[i], nullptr, 0));
+      else if (positional == 3) height = static_cast<uint32_t>(strtoul(argv[i], nullptr, 0));
+      ++positional;
+    }
+    return RunPresentProbe(hwc_path, shim_path, width, height);
   }
 
   if (argc > 1 && strcmp(argv[1], "--hotplug") == 0) {
