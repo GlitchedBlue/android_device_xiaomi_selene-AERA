@@ -1073,8 +1073,8 @@ int RunEglProbe(const char* driver_path, const char* shim_path, uint32_t width,
   gl_gen_framebuffers(2, framebuffers);
 
   static const DmaBufFormat kFormats[] = {
-      {0x34325241u, "AR24"},  // ARGB8888: A,R,G,B in a word -> B,G,R,A bytes
       {0x34324241u, "AB24"},  // ABGR8888: A,B,G,R in a word -> R,G,B,A bytes
+      {0x34325241u, "AR24"},  // ARGB8888: A,R,G,B in a word -> B,G,R,A bytes
       {0x34324752u, "RG24"},
       {0x34324742u, "BG24"},
       {0x34324258u, "XB24"},

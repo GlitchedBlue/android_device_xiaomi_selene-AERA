@@ -1,0 +1,107 @@
+--- a/aeraui/core/gpu_renderer.cpp
++++ b/aeraui/core/gpu_renderer.cpp
+@@ -34,6 +34,16 @@
+ }
+ constexpr uint32_t kDrmFormatAbgr8888 = Fourcc('A', 'B', '2', '4');
+ constexpr EGLenum kEglNativeBufferAndroid = 0x3140;
++// EGL_EXT_image_dma_buf_import. The extension is the only usable import path in
++// recovery: EGL_NATIVE_BUFFER_ANDROID makes Mali resolve the buffer's format
++// itself through IMapper::getService("default"), which needs hwservicemanager,
++// which recovery does not run - the call returns null and the driver
++// dereferences it (libGLES_mali.so+0x85bcb0).
++constexpr EGLenum kEglLinuxDmaBuf = 0x3270;
++constexpr EGLint kEglLinuxDrmFourcc = 0x3271;
++constexpr EGLint kEglDmaBufPlane0Fd = 0x3272;
++constexpr EGLint kEglDmaBufPlane0Offset = 0x3273;
++constexpr EGLint kEglDmaBufPlane0Pitch = 0x3274;
+ 
+ struct SymbolLoader {
+   void* library;
+@@ -247,12 +257,12 @@
+       reinterpret_cast<const char*>(glGetString(GL_EXTENSIONS));
+   auto image_target = reinterpret_cast<ImageTargetTexture>(
+       LoadSymbol(&gles_loader, "glEGLImageTargetTexture2DOES"));
+-  if (!HasExtension(egl_extensions, "EGL_ANDROID_image_native_buffer") ||
++  if (!HasExtension(egl_extensions, "EGL_EXT_image_dma_buf_import") ||
+       !HasExtension(gl_extensions, "GL_OES_EGL_image") ||
+       eglCreateImageKHR == nullptr || eglDestroyImageKHR == nullptr ||
+       image_target == nullptr) {
+     __android_log_print(ANDROID_LOG_WARN, kLogTag,
+-                        "native-buffer image import is unavailable");
++                        "dma-buf image import is unavailable");
+     Shutdown();
+     return false;
+   }
+@@ -270,13 +280,35 @@
+     }
+     buffer_count_ = mali_display_->BufferCount();
+     for (unsigned i = 0; i < buffer_count_; ++i) {
++      int dma_buf_fd = -1;
++      unsigned stride = 0;
++      if (!mali_display_->DescribeBuffer(i, &dma_buf_fd, &stride)) {
++        __android_log_print(ANDROID_LOG_WARN, kLogTag,
++                            "scanout buffer %u has no dma-buf", i);
++        Shutdown();
++        return false;
++      }
++      // Hand Mali the format and pitch instead of a gralloc handle, so it never
++      // asks IMapper for them. kDrmFormatAbgr8888 is the V4L2-style "AB24"
++      // spelling: Mali keys its format table on those names ('ABGR' is rejected
++      // with EGL_BAD_MATCH), and ABGR8888 is A,B,G,R in a little-endian word,
++      // i.e. R,G,B,A in ascending addresses - the layout
++      // HAL_PIXEL_FORMAT_RGBA_8888 gives the composer.
+       const EGLint attributes[] = {
+-          EGL_IMAGE_PRESERVED_KHR, EGL_TRUE, EGL_NONE,
++          EGL_WIDTH, static_cast<EGLint>(width_),
++          EGL_HEIGHT, static_cast<EGLint>(height_),
++          kEglLinuxDrmFourcc, static_cast<EGLint>(kDrmFormatAbgr8888),
++          kEglDmaBufPlane0Fd, dma_buf_fd,
++          kEglDmaBufPlane0Offset, 0,
++          kEglDmaBufPlane0Pitch, static_cast<EGLint>(stride * 4),
++          EGL_NONE,
+       };
+       egl_images_[i] = eglCreateImageKHR(
+-          display, EGL_NO_CONTEXT, kEglNativeBufferAndroid,
+-          mali_display_->Buffer(i), attributes);
++          display, EGL_NO_CONTEXT, kEglLinuxDmaBuf, nullptr, attributes);
+       if (egl_images_[i] == EGL_NO_IMAGE_KHR) {
++        __android_log_print(ANDROID_LOG_WARN, kLogTag,
++                            "dma-buf import %u failed: %#x (fd %d, stride %u)", i,
++                            eglGetError(), dma_buf_fd, stride);
+         Shutdown();
+         return false;
+       }
+--- a/aeraui/core/mali_display.hpp
++++ b/aeraui/core/mali_display.hpp
+@@ -20,6 +20,9 @@
+   bool Initialize(int width, int height);
+   unsigned BufferCount() const;
+   void* Buffer(unsigned index);
++  // dma-buf descriptor and pixel stride of a scanout buffer, for
++  // EGL_EXT_image_dma_buf_import.
++  bool DescribeBuffer(unsigned index, int* fd, unsigned* stride) const;
+   bool Wait(unsigned index);
+   // Takes ownership of acquire_fence, including on failure.
+   bool Present(unsigned index, int acquire_fence = -1);
+--- a/aeraui/core/mali_display.cpp
++++ b/aeraui/core/mali_display.cpp
+@@ -321,6 +321,19 @@
+   return impl_->ready && index < impl_->buffer_count ? &impl_->native[index] : nullptr;
+ }
+ 
++bool MaliDisplay::DescribeBuffer(unsigned index, int* fd, unsigned* stride) const {
++  const auto& state = *impl_;
++  if (!state.ready || index >= state.buffer_count || state.buffers[index] == nullptr)
++    return false;
++  // MediaTek's handle carries the gralloc_extra metadata descriptor first and
++  // the dma-buf second; on selene they read back as "anon_inode:gralloc_extra"
++  // and "/dmabuf:Gralloc". Only the second one can be imported by EGL.
++  if (state.buffers[index]->numFds < 2) return false;
++  if (fd != nullptr) *fd = state.buffers[index]->data[1];
++  if (stride != nullptr) *stride = static_cast<unsigned>(state.native[index].stride);
++  return true;
++}
++
+ unsigned MaliDisplay::BufferCount() const { return impl_->buffer_count; }
+ 
+ bool MaliDisplay::Wait(unsigned index) {

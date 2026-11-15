@@ -773,6 +773,104 @@ FORTIFY: pthread_mutex_lock called on a destroyed mutex
 because MTK's static destructors run at exit. Recovery does not return from a
 reboot, so this only matters if the process is ever exited normally.
 
+### Why `eglCreateImageKHR(EGL_NATIVE_BUFFER_ANDROID)` can never work here
+
+This one cost a while and is worth writing down, because it looks like a shim bug
+and is not.
+
+`gralloc1-probe --egl` got as far as EGL 1.4 + GLES 3.2 (`Mali-G52 MC2`,
+`OpenGL ES 3.2 v1.r32p1-01eac0...`) and then died inside the driver. The
+backtrace put it at `libGLES_mali.so+0x85bcac`, and the faulting instruction is
+
+```
+0085bcac  str      x21, [sp, #0x70]
+0085bcb0  ldr      x8, [x20]          ; x20 == 0 -> SIGSEGV at address 0
+0085bcb8  ldr      x9, [x8, #0xb8]
+0085bcc0  blr      x9
+```
+
+`x20` is the return value of the call at `0x85bc54`, and the PLT stub at
+`0x23bc090` resolves to
+
+```
+_ZN7android8hardware8graphics6mapper4V4_07IMapper10getServiceERKNSt3__112basic_stringIcNS5_11char_traitsIcEENS5_9allocatorIcEEEEb
+```
+
+so the crash is:
+
+```cpp
+static sp<IMapper> mapper = IMapper::getService("default", false);  // 0x85b750
+mapper->get(handle, callback);                                     // vtable +0xb8
+```
+
+`IMapper::getService()` goes through `hwservicemanager`, which recovery does not
+run, so it returns null — and this DDK dereferences it without a check. There is
+no fallback branch in the blob: `0x85bbe8`, whose body is just `handle !=
+nullptr`, is the entire validation. Two consequences:
+
+- The gralloc1 shim is not at fault. The native-buffer import path is simply
+  unavailable in any process without hwservicemanager.
+- The earlier experiment that set `ANativeWindowBuffer.common.magic/version`
+  "fixed" `EGL_BAD_PARAMETER` only by getting past the *earlier* magic check and
+  into this crash. `mali_display.cpp`'s zeroed `magic` was never the problem.
+
+### The fix: import the dma-buf instead
+
+`EGL_EXT_image_dma_buf_import` is in the driver's extension list and takes the
+format and pitch from the caller, so the mapper HAL is never consulted.
+`patches/bootable/recovery/0003-mali-import-scanout-buffers-as-dma-buf.patch`
+switches `GpuRenderer::Initialize()` to it and adds
+`MaliDisplay::DescribeBuffer()` for the fd and stride.
+
+Two details that are easy to get wrong:
+
+1. **Which fd.** MTK's `private_handle_t` carries three descriptors and the
+   dma-buf is not the first:
+
+   ```
+   image 0 : fd[0]=19 -> anon_inode:gralloc_extra
+   image 0 : fd[1]=17 -> /dmabuf:Gralloc
+   image 0 : fd[2]=-1
+   ```
+
+   `DescribeBuffer()` returns `data[1]`.
+
+2. **The fourcc is not the `drm_fourcc.h` spelling.** Mali keys its table on the
+   V4L2-style *names*, so `'ABGR'` (0x52474241) is rejected with `EGL_BAD_MATCH`
+   while `"AB24"` (0x34324241) is accepted. `gralloc1-probe --egl --formats`
+   clears red and then reads the raw dma-buf back, which is the only way to tell
+   RGBA from BGRA — green is symmetric under an R/B swap:
+
+   ```
+   formats : AB24   0x34324241 -> accepted fbo=0x8cd5 gl=255,0,0,255 raw=255,0,0,255  <- R,G,B,A
+   formats : AR24   0x34325241 -> accepted fbo=0x8cd5 gl=255,0,0,255 raw=0,0,255,255
+   formats : BG24   0x34324742 -> accepted fbo=0x8cd5 gl=255,0,0,255 raw=255,0,0,255
+   formats : XB24   0x34324258 -> accepted fbo=0x8cd5 gl=255,0,0,255 raw=255,0,0,0
+   formats : 'ARGB' 0x42475241 -> rejected (0x3009)
+   formats : 'ABGR' 0x52474241 -> rejected (0x3009)
+   formats : 'RGBA' 0x41424752 -> rejected (0x3009)
+   formats : 'BGRA' 0x41524742 -> rejected (0x3009)
+   ```
+
+   `AB24` is `ABGR8888`: `A,B,G,R` in a little-endian word, i.e. `R,G,B,A` in
+   ascending addresses, which is what `HAL_PIXEL_FORMAT_RGBA_8888` means to the
+   composer. `AR24` would have put red in the blue channel.
+
+`gralloc1-probe --egl` now ends with:
+
+```
+image 0 : fd[1]=17 -> /dmabuf:Gralloc
+image 0 : AB24 -> ok
+image 0 : framebuffer 0x8cd5 (complete)
+render  : cleared red, glReadPixels -> 255 0 0 255
+raw     : mmap fd=17 ok, centre pixel 255 0 0 255
+```
+
+so the GPU renders into the scanout buffer, the bytes land where the composer
+expects them, and the layout is linear (a tiled or AFBC buffer would not
+round-trip through a plain `mmap`). `--egl --native` still runs the old
+native-buffer path, which is kept only to reproduce the crash above.
+
 ### Patching the Mali backend
 
 The backend lives in `bootable/recovery` on apkreader's `mali-testing` branch,
