@@ -60,6 +60,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <ucontext.h>
 #include <unistd.h>
 
@@ -770,6 +771,32 @@ constexpr uint64_t kProbeNativeUsage = GRALLOC_USAGE_HW_RENDER |
                                        GRALLOC_USAGE_SW_READ_OFTEN |
                                        GRALLOC_USAGE_SW_WRITE_OFTEN;
 
+// EGL_EXT_image_dma_buf_import, which is the only usable import path in
+// recovery.
+//
+// The obvious call, eglCreateImageKHR(EGL_NATIVE_BUFFER_ANDROID), asks Mali to
+// look the buffer's format up itself, and it does that with
+// android::hardware::graphics::mapper::V4_0::IMapper::getService("default").
+// That call goes through hwservicemanager, which recovery does not run, so it
+// returns null and the driver dereferences it without a check - SIGSEGV at
+// libGLES_mali.so+0x85bcb0, every time. There is no fallback in the blob.
+//
+// The dma-buf extension takes the format and pitch from the caller, so the
+// mapper HAL is never consulted. The shim's descriptor is linear RGBA_8888 and
+// the dma-buf fd is one of the handle's descriptors.
+#ifndef EGL_LINUX_DMA_BUF_EXT
+#define EGL_LINUX_DMA_BUF_EXT 0x3270
+#define EGL_LINUX_DRM_FOURCC_EXT 0x3271
+#define EGL_DMA_BUF_PLANE0_FD_EXT 0x3272
+#define EGL_DMA_BUF_PLANE0_OFFSET_EXT 0x3273
+#define EGL_DMA_BUF_PLANE0_PITCH_EXT 0x3274
+#endif
+#ifndef DRM_FORMAT_ABGR8888
+// HAL_PIXEL_FORMAT_RGBA_8888 keeps R,G,B,A in ascending addresses, which is DRM's
+// "ABGR8888" (0xAABBGGRR read as a little-endian word).
+#define DRM_FORMAT_ABGR8888 0x52474241
+#endif
+
 bool HasExtension(const char* list, const char* name) {
   if (list == nullptr || name == nullptr) return false;
   const size_t length = strlen(name);
@@ -798,7 +825,7 @@ bool LoadGlSymbol(void* library, PFNEGLGETPROCADDRESSPROC get_proc_address,
 }
 
 int RunEglProbe(const char* driver_path, const char* shim_path, uint32_t width,
-                uint32_t height) {
+                uint32_t height, bool use_native) {
   printf("egl     : sizeof(ProbeWindowBuffer)=%zu (arm64 expects 176)\n",
          sizeof(ProbeWindowBuffer));
   printf("egl     : driver %s\n", driver_path);
@@ -1003,37 +1030,67 @@ int RunEglProbe(const char* driver_path, const char* shim_path, uint32_t width,
   bool complete[2] = {false, false};
   gl_gen_textures(2, textures);
   gl_gen_framebuffers(2, framebuffers);
-  int failures = 0;
-  for (int i = 0; i < 2; ++i) {
-    ProbeWindowBuffer window{};
-    // AOSP's GraphicBuffer sets these two; mali_display.cpp does not. Buffer 0
-    // gets them and buffer 1 does not, so one run says whether Mali validates
-    // them (EGL_BAD_PARAMETER if so).
-    if (i == 0) {
-      window.common.magic = 0x5f626672;  // ANDROID_NATIVE_BUFFER_MAGIC ('_bfr')
-      window.common.version = sizeof(ProbeWindowBuffer);
-    }
-    window.common.incRef = ProbeReference;
-    window.common.decRef = ProbeReference;
-    window.width = static_cast<int>(width);
-    window.height = static_cast<int>(height);
-    window.stride = static_cast<int>(strides[i]);
-    window.format = HAL_PIXEL_FORMAT_RGBA_8888;
-    window.layerCount = 1;
-    window.handle = buffers[i];
-    window.usage = kProbeNativeUsage;
-    window.usage_deprecated = static_cast<int>(window.usage);
-    printf("image %d : magic %#x version %zu handle fds=%d ints=%d fd0=%d\n", i,
-           window.common.magic, static_cast<size_t>(window.common.version),
-           buffers[i]->numFds, buffers[i]->numInts, buffers[i]->data[0]);
 
-    const EGLint image_attributes[] = {EGL_IMAGE_PRESERVED_KHR, EGL_TRUE, EGL_NONE};
-    images[i] = create_image(display, EGL_NO_CONTEXT, EGL_NATIVE_BUFFER_ANDROID,
-                             &window, image_attributes);
-    printf("image %d : eglCreateImageKHR -> %p%s\n", i, images[i],
-           images[i] == EGL_NO_IMAGE_KHR ? " (failed)" : "");
+  auto import_dmabuf = [&](int fd, uint32_t stride_pixels) -> EGLImageKHR {
+    const EGLint attributes[] = {
+        EGL_WIDTH, static_cast<EGLint>(width),
+        EGL_HEIGHT, static_cast<EGLint>(height),
+        EGL_LINUX_DRM_FOURCC_EXT, DRM_FORMAT_ABGR8888,
+        EGL_DMA_BUF_PLANE0_FD_EXT, fd,
+        EGL_DMA_BUF_PLANE0_OFFSET_EXT, 0,
+        EGL_DMA_BUF_PLANE0_PITCH_EXT, static_cast<EGLint>(stride_pixels * 4),
+        EGL_NONE,
+    };
+    return create_image(display, EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT, nullptr,
+                        attributes);
+  };
+
+  int failures = 0;
+  int fd_index = -1;
+  for (int i = 0; i < 2; ++i) {
+    printf("buffer %d: fds=%d ints=%d stride=%u\n", i, buffers[i]->numFds,
+           buffers[i]->numInts, strides[i]);
+    if (use_native) {
+      ProbeWindowBuffer window{};
+      // AOSP's GraphicBuffer sets these two; mali_display.cpp does not. Buffer 0
+      // gets them and buffer 1 does not, so one run says whether Mali validates
+      // them (EGL_BAD_PARAMETER if so).
+      if (i == 0) {
+        window.common.magic = 0x5f626672;  // ANDROID_NATIVE_BUFFER_MAGIC ('_bfr')
+        window.common.version = sizeof(ProbeWindowBuffer);
+      }
+      window.common.incRef = ProbeReference;
+      window.common.decRef = ProbeReference;
+      window.width = static_cast<int>(width);
+      window.height = static_cast<int>(height);
+      window.stride = static_cast<int>(strides[i]);
+      window.format = HAL_PIXEL_FORMAT_RGBA_8888;
+      window.layerCount = 1;
+      window.handle = buffers[i];
+      window.usage = kProbeNativeUsage;
+      window.usage_deprecated = static_cast<int>(window.usage);
+      const EGLint image_attributes[] = {EGL_IMAGE_PRESERVED_KHR, EGL_TRUE,
+                                         EGL_NONE};
+      images[i] = create_image(display, EGL_NO_CONTEXT, EGL_NATIVE_BUFFER_ANDROID,
+                               &window, image_attributes);
+      printf("image %d : native buffer -> %p (error %#x)\n", i, images[i],
+             images[i] == EGL_NO_IMAGE_KHR ? get_error() : 0);
+    } else {
+      // The handle carries more than one descriptor, so find the one that is
+      // actually the dma-buf rather than assuming an order. The index found for
+      // buffer 0 is reused for buffer 1.
+      const int first = fd_index >= 0 ? fd_index : 0;
+      const int last = fd_index >= 0 ? fd_index : buffers[i]->numFds - 1;
+      for (int k = first; k <= last && images[i] == EGL_NO_IMAGE_KHR; ++k) {
+        const int fd = buffers[i]->data[k];
+        images[i] = import_dmabuf(fd, strides[i]);
+        const EGLint error = images[i] == EGL_NO_IMAGE_KHR ? get_error() : 0;
+        printf("image %d : fd[%d]=%d -> %s (error %#x)\n", i, k, fd,
+               images[i] == EGL_NO_IMAGE_KHR ? "failed" : "ok", error);
+        if (images[i] != EGL_NO_IMAGE_KHR) fd_index = k;
+      }
+    }
     if (images[i] == EGL_NO_IMAGE_KHR) {
-      printf("image %d : eglGetError %#x\n", i, get_error());
       ++failures;
       continue;
     }
@@ -1067,6 +1124,24 @@ int RunEglProbe(const char* driver_path, const char* shim_path, uint32_t width,
     printf("render  : cleared green, glReadPixels -> %u %u %u %u (want 0 255 0 255)\n",
            pixel[0], pixel[1], pixel[2], pixel[3]);
     if (pixel[1] != 255) ++failures;
+
+    // Independent check that the GPU wrote through to the dma-buf itself: map
+    // it and look at the middle pixel. If this disagrees with glReadPixels the
+    // buffer is not linear (tiled or AFBC), and HWC would not agree with the GPU
+    // either - which is the one thing dma-buf import cannot tell us on its own.
+    const int fd = buffers[0]->data[fd_index >= 0 ? fd_index : 0];
+    const size_t length = static_cast<size_t>(strides[0]) * 4 * height;
+    void* mapped = mmap(nullptr, length, PROT_READ, MAP_SHARED, fd, 0);
+    if (mapped != MAP_FAILED) {
+      const auto* base = static_cast<const uint8_t*>(mapped);
+      const auto* centre =
+          base + (static_cast<size_t>(height / 2) * strides[0] + width / 2) * 4;
+      printf("raw     : mmap fd=%d ok, centre pixel %u %u %u %u\n", fd, centre[0],
+             centre[1], centre[2], centre[3]);
+      munmap(mapped, length);
+    } else {
+      printf("raw     : mmap fd=%d failed: %d\n", fd, errno);
+    }
   }
 
   printf("teardown: %d failure(s); the driver is not unloaded\n", failures);
@@ -1134,8 +1209,13 @@ int main(int argc, char** argv) {
     const char* shim_path = "/gpu/stock-vendor/lib64/hw/gralloc.mt6768.so";
     uint32_t width = 1080;
     uint32_t height = 2400;
+    bool use_native = false;
     int positional = 0;
     for (int i = 2; i < argc; ++i) {
+      if (strcmp(argv[i], "--native") == 0) {
+        use_native = true;
+        continue;
+      }
       if (strncmp(argv[i], "--", 2) == 0) continue;
       if (positional == 0) driver_path = argv[i];
       else if (positional == 1) shim_path = argv[i];
@@ -1143,7 +1223,7 @@ int main(int argc, char** argv) {
       else if (positional == 3) height = static_cast<uint32_t>(strtoul(argv[i], nullptr, 0));
       ++positional;
     }
-    return RunEglProbe(driver_path, shim_path, width, height);
+    return RunEglProbe(driver_path, shim_path, width, height, use_native);
   }
 
   if (argc > 1 && strcmp(argv[1], "--hotplug") == 0) {
