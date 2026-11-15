@@ -1,0 +1,28 @@
+// Copyright (C) 2026 AERA Recovery Project contributors
+// SPDX-License-Identifier: Apache-2.0
+//
+// libaera_gralloc1: gralloc1 API on top of MediaTek's exported mali_gralloc
+// entry points. See gralloc1_shim.cpp for the full story, including the
+// descriptor offsets recovered from the vendor binary.
+//
+// stl: "none" and no shared_libs on purpose. The module is dlopen()ed into
+// AERA's private linker namespace, which shares exactly libc/libm/libdl with
+// the recovery process; anything else would have to be staged into the blob
+// store as well. The shim therefore writes its diagnostics to /tmp/gralloc1.log
+// instead of using liblog.
+//
+// The file is published as gralloc.mt6768.so and loaded from the blob store
+// via ro.aera.gpu.gralloc, so it is not installed into the recovery ramdisk.
+
+cc_library_shared {
+    name: "libaera_gralloc1",
+    srcs: ["gralloc1_shim.cpp"],
+
+    // HAL_MODULE_INFO_SYM and the gralloc1 entry points must be exported.
+    cflags: [
+        "-Wall",
+        "-fvisibility=default",
+    ],
+
+    stl: "none",
+}

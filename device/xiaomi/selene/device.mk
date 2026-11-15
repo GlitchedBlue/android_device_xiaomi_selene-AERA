@@ -80,13 +80,18 @@ PRODUCT_PACKAGES += libaera_boot_trim
 # There is NO gralloc1 module anywhere on the device: gralloc.default.so is the
 # generic fbdev gralloc0 module (fb_device_open + ashmem), and the MediaTek
 # gralloc.mt6768.so that Android 10/11 trees shipped is gone. The backend calls
-# gralloc1_open(), so ro.aera.gpu.gralloc deliberately names the absent module:
-# Load() fails, MaliDisplay reports a display-HAL failure, and GpuRenderer
-# returns false so AERA keeps the software renderer. Point it at a real gralloc1
-# module and the backend initializes without any other change.
+# gralloc1_open(), so ro.aera.gpu.gralloc names libaera_gralloc1, a shim that
+# implements the gralloc1 API over the plain mali_gralloc entry points the
+# MediaTek allocator@4.0 impl exports (gralloc1_compat/gralloc1_shim.cpp).
 #
 # Do not point it at gralloc.default.so: opening a gralloc0 device through
 # gralloc1_open() hands the backend a mismatched function table.
+#
+# libaera_gralloc1 is not part of the ramdisk; CI publishes it as
+# gralloc.mt6768.so and it is staged into the blob store like the other stock
+# vendor libraries. PRODUCT_PACKAGES keeps it building with the image so the
+# two never drift.
+PRODUCT_PACKAGES += libaera_gralloc1
 PRODUCT_DEFAULT_PROPERTY_OVERRIDES += \
     ro.aera.gpu.mali_driver=/gpu/stock-vendor/lib64/egl/libGLES_mali.so \
     ro.aera.gpu.mali_libraries=/gpu/lib64 \

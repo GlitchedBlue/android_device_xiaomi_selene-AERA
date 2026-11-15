@@ -313,6 +313,45 @@ jobs:
           cp -f "${SHIM}" "${DEVICE_PATH}/recovery/root/sbin/"
           ls -l "${DEVICE_PATH}/recovery/root/sbin/libaera_boot_trim.so"
 
+          # gralloc1 shim: the gralloc1 API implemented over the plain
+          # mali_gralloc entry points MediaTek's allocator@4.0 impl exports.
+          # selene has no gralloc1 module, and the fbdev gralloc0 module is not
+          # a substitute. This one is not part of the ramdisk -- the backend
+          # loads it from the staged blob store through ro.aera.gpu.gralloc --
+          # so build it explicitly and check the two properties that make it
+          # loadable inside the Mali namespace.
+          m libaera_gralloc1
+          GRALLOC=$(find out/soong/.intermediates "out/target/product/${DEVICE}" \
+            -name libaera_gralloc1.so -print -quit 2>/dev/null)
+          if [ -z "${GRALLOC}" ]; then
+            echo "::error::libaera_gralloc1.so was not produced by 'm libaera_gralloc1'"
+            exit 1
+          fi
+          echo "gralloc shim built: ${GRALLOC}"
+          if ! readelf -hW "${GRALLOC}" | grep -q 'AArch64'; then
+            echo "::error::libaera_gralloc1.so is not an AArch64 object"
+            readelf -hW "${GRALLOC}" || true
+            exit 1
+          fi
+          # dlsym(HAL_MODULE_INFO_SYM_AS_STR) is how mali_display.cpp finds the
+          # module, so a hidden symbol would make the HAL invisible.
+          if ! readelf -sW "${GRALLOC}" | grep -q ' HAL_MODULE_INFO_SYM$'; then
+            echo "::error::libaera_gralloc1.so does not export HAL_MODULE_INFO_SYM"
+            readelf -sW "${GRALLOC}" | tail -20 || true
+            exit 1
+          fi
+          # The private namespace is linked to the recovery process for exactly
+          # libc/libm/libdl. Any other DT_NEEDED would have to be staged into
+          # the blob store as well, so fail loudly instead of shipping a shim
+          # that cannot resolve.
+          if readelf -dW "${GRALLOC}" | grep NEEDED | grep -Ev 'libc\.so|libm\.so|libdl\.so'; then
+            echo "::error::libaera_gralloc1.so depends on a library the Mali namespace does not share"
+            exit 1
+          fi
+          mkdir -p "${GITHUB_WORKSPACE}/artifacts"
+          cp -f "${GRALLOC}" "${GITHUB_WORKSPACE}/artifacts/gralloc.mt6768.so"
+          ls -l "${GITHUB_WORKSPACE}/artifacts/gralloc.mt6768.so"
+
           set +e
           mka adbd "${BUILD_TARGET}"
           rc=$?
