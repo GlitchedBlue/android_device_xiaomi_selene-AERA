@@ -1029,23 +1029,64 @@ Run #7 measured, for future reference: 148 min wall, of which `Cleanup` 4.4,
 | #8 `43774984519` | failure, 60 min | `Build` at ~37 min | runner lost communication; log blob never uploaded |
 | #9 `43782632428` | failure, 60 min | `Build` at ~37 min | same |
 | #10 `43788533915` | failure, 62 min | `Build` at ~36 min | same |
+| #11 `43810934391` | failure, 59 min | `Build` at ~46 min | same, but with `-j3` and `GOMEMLIMIT 6GiB` |
+| #12 `43822760838` | cancelled | `Sync` | superseded by the instrumented build; it carried the disk test but no witness |
+| #13 `43824966283` | in flight | — | swap 8 GB, ccache, commit-comment telemetry, disk watchdog |
 
-### The runner dies ~37 minutes into `Build` (2026-11-16)
+### The runner dies ~46 minutes into `Build` (2026-11-16, revised)
 
-Three consecutive builds died the same way: the job ends as `failure` with the
-step still `in_progress`, the annotation reads *"The hosted runner lost
-communication with the server"*, and `GET /actions/jobs/<id>/logs` answers 404
-because the runner never got to upload anything. GitHub is also late by about
-ten minutes, so a job reported at 60:01 actually died at ~50:00, which is ~37
-minutes into `Build` each time — deterministic, not a flake.
+The first diagnosis was memory and it was wrong. `-j3` and `GOMEMLIMIT 6GiB`
+were applied and the death moved by zero (run #11: 46.3 min, inside the same
+46.0-47.7 min band as the `-j$(nproc)` runs). What the numbers say now:
 
-That signature is resource starvation of the runner agent, not a compile error.
-`GOMEMLIMIT` was `11GiB` on a 15 GiB machine, which keeps `soong_build` alive
-but leaves the four parallel compilers nothing but swap; the VM thrashes,
-`Runner.Listener` stops answering, and the job is declared lost. It is now
-`6GiB` (this tree's soong_build needs 2-4 GiB) and `mka` runs `-j3`, which caps
-the other half of the peak. A build that dies costs two and a half hours; the
-parallelism cap costs minutes.
+- `Build` dies at 46.0, 46.0, 46.3 and 47.7 minutes: a 3.5% spread. Job totals
+  are 59-62 min because GitHub notices about ten minutes late, so the machine
+  really dies at ~49-52 min of job time.
+- Run #7 was green with a **133 minute** `Build` on the same runner class, so
+  there is no job limit and no plain wall clock. Any "60 minute cap" theory,
+  including an account-level one, is refuted by that run.
+- The runner image did not change either: the newest `ubuntu24` release is
+  `ubuntu24/20261111.370`, published Nov 11, three days *before* #7.
+
+**One caveat, do not skip it.** The tight `Build` band only proves a wall clock
+if `-j3` actually reached ninja. `mka` forwards unknown flags through
+`soong_ui`, and nothing has verified that ninja honoured it. If it did not, then
+`-j3` never happened and the band is consistent with a fixed *point in the
+build* instead. The sampler's `load` field settles this: ~4 means the cap never
+applied, ~3 means it did.
+
+What changed between the green #7 and the first failure #8 — `bde80206..HEAD`
+is 38 commits and 26 files, but only these touch the build:
+
+| change | commit |
+| --- | --- |
+| `libaera_gralloc1` module, an extra `m libaera_gralloc1` **before** `mka`, `PRODUCT_PACKAGES += libaera_gralloc1` | `f8c7e110` |
+| patches `0001`/`0002`/`0003` applied to `bootable/recovery` | `da146afe` |
+| two props in `device.mk` (gralloc path, acquire-fence ownership) | `da146afe` |
+
+Everything else is `HANDOFF.md`, `README.md`, `shim-headers/` and the probe.
+`swap 30->8`, `-j3` and `GOMEMLIMIT` are *after* #8, so they are not the cause.
+
+There is one explanation that needs no commit from us at all: `MANIFEST_BRANCH`
+is a moving branch, so `repo sync` can change build input between two runs of
+the same SHA. Keep it in mind before blaming a patch.
+
+**Why the log is always 404.** GitHub uploads a job log only when the job ends;
+a runner that dies mid-step never uploads, and an in-progress log is 404 as
+well. The annotation is the only survivor. A runner that cannot write its own
+log is also exactly what a full disk looks like, which is why disk was never
+excluded.
+
+**Instruments, added 2026-11-16.** Both are designed to survive the runner:
+
+- a sampler that posts disk, `out/` size, memory, swap, load and the top three
+  RSS processes as a **commit comment** every two minutes. Commit comments need
+  only `contents: write` and were verified end to end (201 create, 204 delete).
+  Check runs were tried first and dropped: creating one needs a GitHub App
+  (`403 You must authenticate via a GitHub App`), so it cannot be verified from
+  outside a run, and an unverifiable witness is worse than none.
+- a watchdog that kills the build below 2 GB free, so a disk death becomes a
+  normal failure with a log instead of a vanished runner.
 
 Do not "fix" this by raising `GOMEMLIMIT` again, and do not conclude the patch
 is broken when the log is missing — check
