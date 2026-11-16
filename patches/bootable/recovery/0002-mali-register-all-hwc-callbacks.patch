@@ -23,7 +23,7 @@
      if (has_layer && destroy_layer)
        destroy_layer(composer, display.load(), layer);
      if (composer) composer->common.close(&composer->common);
-@@ -277,6 +283,19 @@
+@@ -277,10 +283,37 @@
        !GetFunction(state.composer, HWC2_FUNCTION_GET_RELEASE_FENCES, &state.get_release_fences) ||
        !GetFunction(state.composer, HWC2_FUNCTION_DESTROY_LAYER, &state.destroy_layer))
      return Fail("HWC2 function table");
@@ -43,3 +43,21 @@
    if (state.register_callback(state.composer, HWC2_CALLBACK_HOTPLUG, &state,
            reinterpret_cast<hwc2_function_pointer_t>(Impl::Hotplug)))
      return Fail("hotplug registration");
++  // DisplayManager::init() installs the listener and re-sends a synthetic
++  // "display 0 connected", but only to a callback registered after init() has
++  // run -- i.e. to a *second* registration. This is what gralloc1-probe
++  // measured on the device: hotplug alone reports nothing, hotplug again right
++  // after vsync+refresh reports display 0 connected.
++  if (state.register_callback(state.composer, HWC2_CALLBACK_HOTPLUG, &state,
++          reinterpret_cast<hwc2_function_pointer_t>(Impl::Hotplug)))
++    return Fail("hotplug re-registration");
+   state.registered = true;
++  // The callback may also arrive on the composer's own thread a moment later,
++  // so give it a bounded window instead of testing once and failing.
++  for (int waited_ms = 0; waited_ms < 2000 && !state.connected.load();
++       waited_ms += 10) {
++    usleep(10000);
++  }
+   if (!state.connected.load()) return Fail("primary display discovery");
+   const auto display = state.display.load();
+   if (SET_POWER_MODE(state.composer, display, HWC2_POWER_MODE_ON))

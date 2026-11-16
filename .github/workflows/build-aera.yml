@@ -443,15 +443,36 @@ jobs:
           echo "mali backend: $(git -C bootable/recovery rev-parse --short HEAD)"
           echo "lvgl:         $(git -C external/lvgl rev-parse --short HEAD)"
 
+      # The build job never checked this repository out. ${GITHUB_WORKSPACE}
+      # therefore had no patches/ directory, so the patch loop below walked a
+      # glob that matched nothing, and run 43899667091 logged
+      #
+      #   patches applied: 0
+      #
+      # while every step stayed green. That is the whole reason the image it
+      # produced contains none of the GPU patches: the compiler was handed the
+      # pristine apkreader sources. Check the repository out explicitly, and use
+      # the same checkout for the device tree so there is only one clone.
+      - name: Check out this repository (device tree and patches)
+        uses: actions/checkout@v4
+        with:
+          path: src
+          fetch-depth: 1
+
       - name: Add the device tree
         run: |
           cd "${WORKDIR}"
-          git clone --depth=1 "https://github.com/${{ github.repository }}.git" -b "${DEVICE_BRANCH}" /tmp/dt
+          src="${GITHUB_WORKSPACE}/src"
+          test -d "${src}/${DEVICE_PATH}" \
+            || { echo "::error::${DEVICE_PATH} is missing from the checkout"; ls -la "${src}"; exit 1; }
+          test -d "${src}/patches" \
+            || { echo "::error::patches/ is missing from the checkout"; ls -la "${src}"; exit 1; }
           mkdir -p device/xiaomi
           rm -rf "${DEVICE_PATH}"
-          cp -a "/tmp/dt/${DEVICE_PATH}" "${DEVICE_PATH}"
+          cp -a "${src}/${DEVICE_PATH}" "${DEVICE_PATH}"
           chmod +x "${DEVICE_PATH}/vendorsetup.sh" 2>/dev/null || true
           echo "device tree files: $(find "${DEVICE_PATH}" -type f | wc -l)"
+          echo "patch files: $(find "${src}/patches" -name '*.patch' | wc -l)"
 
       # ---------------------------------------------------------------------
       # Local patches to synced projects
@@ -467,10 +488,29 @@ jobs:
       - name: Apply local patches
         run: |
           cd "${WORKDIR}"
-          root="${GITHUB_WORKSPACE}/patches"
+          root="${GITHUB_WORKSPACE}/src/patches"
+          if [ ! -d "${root}" ]; then
+            echo "::error::${root} does not exist -- the checkout step did not run or did not include patches/"
+            ls -la "${GITHUB_WORKSPACE}" || true
+            exit 1
+          fi
           shopt -s globstar nullglob
+          # Materialise the glob first and count it. The old loop ran straight
+          # over "$root"/**/*.patch, so a glob that matched nothing left the
+          # whole step green while changing no file at all -- which is how run
+          # 43899667091 shipped an image whose recovery binary provably contains
+          # none of these patches (no Impl::Vsync in .gnu_debugdata, no
+          # "vsync/refresh registration" string, .text byte-identical to the
+          # image built before the patches existed).
+          files=("$root"/**/*.patch)
+          echo "patch files found: ${#files[@]}"
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "::error::the patch glob matched nothing; refusing to build an unpatched image"
+            ls -la "${root}" || true
+            exit 1
+          fi
           count=0
-          for patch in "$root"/**/*.patch; do
+          for patch in "${files[@]}"; do
             project="${patch#"$root"/}"
             project="${project%/*}"
             echo "applying $(basename "$patch") to ${project}"
@@ -482,8 +522,37 @@ jobs:
             count=$((count + 1))
           done
           echo "patches applied: ${count}"
+          if [ "${count}" -ne "${#files[@]}" ]; then
+            echo "::error::applied ${count} of ${#files[@]} patches"
+            exit 1
+          fi
           git -C bootable/recovery --no-pager log --oneline -1
           git -C bootable/recovery --no-pager diff --stat
+          git -C bootable/recovery --no-pager status --short
+
+          # The patches are applied to a working tree that the build is then
+          # expected to read. Prove the markers are in that tree, so a revert or
+          # a wrong working directory fails here and not 90 minutes later.
+          fail=0
+          grep -q 'vsync/refresh registration' \
+            bootable/recovery/aeraui/core/mali_display.cpp \
+            || { echo "::error::patch 0002 is not in aeraui/core/mali_display.cpp"; fail=1; }
+          grep -q 'DescribeBuffer' \
+            bootable/recovery/aeraui/core/mali_display.cpp \
+            || { echo "::error::patch 0003 is not in aeraui/core/mali_display.cpp"; fail=1; }
+          grep -q 'dma-buf import %u failed' \
+            bootable/recovery/aeraui/core/gpu_renderer.cpp \
+            || { echo "::error::patch 0003 is not in aeraui/core/gpu_renderer.cpp"; fail=1; }
+          if grep -q 'if (composer_library) dlclose(composer_library);' \
+               bootable/recovery/aeraui/core/mali_display.cpp; then
+            echo "::error::patch 0001 is not in aeraui/core/mali_display.cpp"
+            fail=1
+          fi
+          if [ "${fail}" -ne 0 ]; then
+            echo "::error::the patches applied but the markers are missing from the tree"
+            exit 1
+          fi
+          echo "patch markers verified in the working tree"
 
       # .repo holds the full git history of ~1000 projects. It is worthless
       # once the working tree exists, and dropping it reclaims ~18 GB right
@@ -813,6 +882,34 @@ jobs:
           # fails once at the end.
           FAIL=0
           if [ "$rc" -eq 0 ]; then
+            # The GPU patches have to be visible in the binary that actually
+            # ships. Run 43899667091 produced a green image whose
+            # /system/bin/recovery provably contained none of them: its
+            # .gnu_debugdata exports Impl::Hotplug but not Impl::Vsync or
+            # MaliDisplay::DescribeBuffer, and none of the patches' log strings
+            # are present. Checking the artefact, not the source tree, is the
+            # only way to catch a build that ignored the patched working tree.
+            RECOVERY_BIN=$(find "out/target/product/${DEVICE}" \
+              -path '*recovery/root/system/bin/recovery' -print -quit 2>/dev/null)
+            if [ -z "${RECOVERY_BIN}" ]; then
+              RECOVERY_BIN=$(find out/soong/.intermediates "out/target/product/${DEVICE}" \
+                -path '*/recovery' -type f -print -quit 2>/dev/null)
+            fi
+            if [ -z "${RECOVERY_BIN}" ]; then
+              echo "::error::the built recovery binary was not found; cannot verify the GPU patches are in it"
+              FAIL=1
+            else
+              echo "recovery binary: ${RECOVERY_BIN} ($(stat -c %s "${RECOVERY_BIN}") bytes)"
+              for marker in 'vsync/refresh registration' 'dma-buf import %u failed'; do
+                if grep -qa -- "${marker}" "${RECOVERY_BIN}"; then
+                  echo "patch marker present: ${marker}"
+                else
+                  echo "::error::the built recovery binary does not contain '${marker}' -- the local patches did not reach the compiler"
+                  FAIL=1
+                fi
+              done
+            fi
+
             GRALLOC=$(find out/soong/.intermediates "out/target/product/${DEVICE}" \
               -name libaera_gralloc1.so -print -quit 2>/dev/null)
             if [ -z "${GRALLOC}" ]; then
