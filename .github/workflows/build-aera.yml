@@ -51,6 +51,17 @@ on:
       - 'patches/**'
       - '.github/workflows/build-aera.yml'
 
+  # Retry has to come from *outside* the job. When a hosted runner dies, none of
+  # that job's later steps run -- so the in-job "Queue the next build" step can
+  # never fire for the one failure it exists to cover. A schedule event is
+  # evaluated by GitHub itself, so it still fires when the runner is gone.
+  #
+  # Every 30 minutes is much more often than a build can finish (2h+), so the
+  # gate job does the real work: it skips unless HEAD has no green build yet and
+  # nothing for HEAD is currently running.
+  schedule:
+    - cron: '*/30 * * * *'
+
 concurrency:
   group: aera-selene
   cancel-in-progress: false
@@ -62,8 +73,91 @@ permissions:
   actions: write
 
 jobs:
+  # Only runs for the cron. A schedule fires blindly, so this decides whether
+  # there is anything left to do: skip if HEAD is already green, skip if
+  # something for HEAD is still running, and stop after 8 failed attempts so
+  # the cron cannot burn 350 minutes at a time forever.
+  #
+  # It never fails. If the API call breaks it says "go" -- a wasted attempt is
+  # cheaper than a gate that silently stalls every future one.
+  gate:
+    name: Is there anything left to build?
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      go: ${{ steps.decide.outputs.go }}
+    steps:
+      - name: Decide
+        id: decide
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -u
+          echo "go=no" >> "${GITHUB_OUTPUT}"
+          api="https://api.github.com/repos/${GITHUB_REPOSITORY}"
+          hdr=(-H "Authorization: Bearer ${GITHUB_TOKEN}"
+               -H "Accept: application/vnd.github+json"
+               -H "X-GitHub-Api-Version: 2022-11-28")
+          branch="${GITHUB_REF_NAME}"
+          echo "branch ${branch}"
+
+          if ! sha=$(curl -sS "${hdr[@]}" "${api}/branches/${branch}" | jq -r .commit.sha); then
+            echo "::warning::could not resolve HEAD; building anyway"
+            echo "go=yes" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+          echo "head ${sha}"
+
+          if ! runs=$(curl -sS "${hdr[@]}" "${api}/actions/runs?head_sha=${sha}&per_page=100"); then
+            echo "::warning::could not list runs; building anyway"
+            echo "go=yes" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          # This run is itself in the list, and it is 'queued' or 'in_progress'
+          # while this step executes -- so it has to be excluded or 'active'
+          # would always be at least one and the gate would never open.
+          verdict=$(printf '%s' "${runs}" | jq -r --arg me "${GITHUB_RUN_ID}" '
+            [ .workflow_runs[]
+              | select(.name | startswith("Build AERA"))
+              | select((.id | tostring) != $me) ]
+            | [ (map(select(.conclusion == "success")) | length),
+                (map(select(.status == "in_progress"
+                            or .status == "queued"
+                            or .status == "pending"
+                            or .status == "requested"
+                            or .status == "waiting")) | length),
+                (map(select(.conclusion == "failure")) | length) ]
+            | @tsv')
+
+          read -r green active failed <<< "${verdict}"
+          # jq failing must not turn into an arithmetic error under `set -u`.
+          green=${green:-0}
+          active=${active:-0}
+          failed=${failed:-0}
+          echo "green=${green} active=${active} failed=${failed}"
+
+          if [ "${green}" -gt 0 ]; then
+            echo "HEAD already has a green build; nothing to do"
+            exit 0
+          fi
+          if [ "${active}" -gt 0 ]; then
+            echo "${active} run(s) already active for HEAD; letting them finish"
+            exit 0
+          fi
+          if [ "${failed}" -ge 8 ]; then
+            echo "::warning::HEAD has ${failed} failed attempts; not retrying automatically"
+            exit 0
+          fi
+          echo "go=yes" >> "${GITHUB_OUTPUT}"
+
   build:
     name: Build AERA for selene
+    needs: [gate]
+    # always(), because gate is skipped for every event except the cron, and a
+    # skipped dependency would otherwise skip this job too.
+    if: always() && (github.event_name != 'schedule' || needs.gate.outputs.go == 'yes')
     runs-on: ubuntu-24.04
     timeout-minutes: 350
 
@@ -124,6 +218,44 @@ jobs:
         uses: pierotofy/set-swap-space@master
         with:
           swap-size-gb: 30
+
+      # These builds do not die from an OOM kill. They die because the GitHub
+      # agent loses its heartbeat while the box thrashes. Measured in run
+      # 43851152934: soong_build held 13.8 GB resident while 19.6 GB sat in
+      # *disk* swap, PSI avg10 ran 10-44%, and load sat near 5 on 4 vCPUs. Every
+      # page fault during soong's analysis was a round trip to the swapfile, and
+      # with ~30 GB of live working set on a 16 GB box that never stops.
+      #
+      # zram gives the kernel a swap device that lives in RAM and is compressed
+      # (lz4, roughly 2.5x on this kind of data), so most of the overflow costs
+      # a memcpy instead of a disk seek. It is swapon'd at priority 100, above
+      # the swapfile's auto-assigned -2, so zram fills first and the 30 GB file
+      # only catches what will not compress.
+      #
+      # swappiness 100 is the recommended value for zram: with a fast compressed
+      # device, evicting anonymous pages is cheaper than dropping page cache.
+      - name: Add compressed RAM swap
+        run: |
+          set -u
+          if ! sudo modprobe zram num_devices=1 2>/dev/null; then
+            echo "::warning::zram module unavailable; staying on disk swap only"
+            exit 0
+          fi
+          for alg in lz4 zstd; do
+            if echo "${alg}" | sudo tee /sys/block/zram0/comp_algorithm >/dev/null 2>&1; then
+              echo "zram compression: ${alg}"
+              break
+            fi
+          done
+          if ! echo 24G | sudo tee /sys/block/zram0/disksize >/dev/null; then
+            echo "::warning::could not size zram0; staying on disk swap only"
+            exit 0
+          fi
+          sudo mkswap /dev/zram0 >/dev/null
+          sudo swapon --priority 100 /dev/zram0
+          sudo sysctl -w vm.swappiness=100 >/dev/null
+          echo "--- swap devices (zram first) ---"
+          swapon --show
 
       - name: Show resources
         run: |
@@ -355,24 +487,25 @@ jobs:
       # ---------------------------------------------------------------------
       # GOGC/GOMEMLIMIT/GOMAXPROCS bound Soong's Go heap.
       #
-      # These were 40 / 11GiB / 2, copied from ILYESwsa's F11 workflow. The
-      # sampler in run 43851152934 showed that 11GiB is *below* what this tree's
-      # analysis needs: soong_build sat at 12.2-13.9 GB RSS for 41 straight
-      # minutes, swap climbed to 19.6 GB, and not one clang process ever
-      # started. That is the Go runtime in its "cannot reach the soft limit"
-      # mode -- when the live heap is above GOMEMLIMIT, GC runs back to back
-      # forever, and the analysis crawls instead of finishing.
+      # 40 / 11GiB / 2 is the combination from run #7, the only build that has
+      # ever produced an image here (148.7 min wall, Build 7987 s). It is also
+      # what ILYESwsa's F11 workflow uses on the same runner class.
       #
-      # So the limit is now set *above* the observed working set instead of
-      # below it (14 GiB clears the sustained 12.2-13.9 GB, and leaves ~1 GB
-      # for the OS on a 15.6 GiB box). A normal GC cadence that occasionally
-      # swaps is better than a permanent GC spiral that never reaches the
-      # compiler at all. GOGC and GOMAXPROCS keep the values from the one green
-      # run; only the ceiling moves.
+      # 14 GiB was tried in run 43862828722, on the theory that 11 GiB was below
+      # the working set and causing a GC spiral. It did not help: that run died
+      # at ~64 minutes in Build with soong_build at 14.8 GB RSS *and* 17 GB
+      # swapped, i.e. a ~30 GB live working set. Soong has no
+      # runtime/debug.SetMemoryLimit call anywhere (checked cmd/soong_build and
+      # ui/build), so GOMEMLIMIT does reach the Go runtime -- the analysis
+      # genuinely needs ~30 GB and no GC setting changes that. The limit is not
+      # what keeps this alive; the 30 GB swap file is.
+      #
+      # Back to 11 GiB, the proven value. Do not raise it again expecting a
+      # memory win; the only thing that reliably survives is more swap.
       - name: Build
         env:
           GOGC: "40"
-          GOMEMLIMIT: "14GiB"
+          GOMEMLIMIT: "11GiB"
           GOMAXPROCS: "2"
           ALLOW_MISSING_DEPENDENCIES: "true"
           # The sampler inside this step posts commit comments, and the token
@@ -788,41 +921,12 @@ jobs:
           path: ${{ env.CCACHE_DIR }}
           key: aera-ccache-${{ env.MANIFEST_BRANCH }}-${{ github.run_id }}
 
-      # Budget stops are the normal way this workflow makes progress: each run
-      # banks its compiler cache and the next one resumes further along. Doing
-      # that by hand needs a laptop on the network, so the run queues its own
-      # successor. workflow_dispatch is the one event GITHUB_TOKEN is allowed to
-      # trigger, which is why this is a dispatch and not a push.
-      - name: Queue the next build
-        if: always()
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          CHAIN: ${{ github.event.inputs.chain || '0' }}
-        run: |
-          if [ ! -e /tmp/budget_stop ]; then
-            echo "not a budget stop; not queueing a successor"
-            exit 0
-          fi
-          if [ "${CHAIN:-0}" -ge 8 ]; then
-            echo "::warning::chain reached generation ${CHAIN}; stopping so it cannot run forever"
-            exit 0
-          fi
-          next=$(( ${CHAIN:-0} + 1 ))
-          echo "queueing generation ${next} on ${GITHUB_REF_NAME}"
-          code=$(curl -sS -o /tmp/dispatch.out -w '%{http_code}' \
-            -X POST \
-            -H "Authorization: Bearer ${GITHUB_TOKEN}" \
-            -H "Accept: application/vnd.github+json" \
-            -H "X-GitHub-Api-Version: 2022-11-28" \
-            "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/workflows/build-aera.yml/dispatches" \
-            -d "{\"ref\":\"${GITHUB_REF_NAME}\",\"inputs\":{\"chain\":\"${next}\",\"target\":\"${BUILD_TARGET}\",\"device_branch\":\"${DEVICE_BRANCH}\"}}")
-          echo "dispatch HTTP ${code}"
-          cat /tmp/dispatch.out 2>/dev/null || true
-          if [ "${code}" != "204" ]; then
-            echo "::error::could not queue the next build (HTTP ${code})"
-            exit 1
-          fi
-
+      # There used to be a "Queue the next build" step here. It could only fire
+      # on a budget stop, and the budget is gone; more to the point, the failure
+      # it existed to cover -- a hosted runner dying mid-build -- runs no steps
+      # at all, so it could never have fired for that case either. Retries are
+      # owned by the `schedule:` trigger and the `gate` job at the top of this
+      # file, which GitHub evaluates whether or not a runner is still alive.
       - name: Stop resource telemetry
         if: always()
         env:
