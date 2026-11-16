@@ -82,8 +82,20 @@ jobs:
       # more than any tuning of -j, because it removes work instead of
       # redistributing it.
       #
-      # USE_CCACHE/CCACHE_EXEC are the pair soong looks for; CCACHE_DIR has to
-      # live under github.workspace or the cache action cannot see it.
+      # USE_CCACHE/CCACHE_EXEC are NOT what soong reads to wrap the compiler.
+      # On android16 the only consumer of USE_CCACHE is a single flag in
+      # cc/config/global.go (-Wno-unused-command-line-argument); the wrapper
+      # comes from cc/builder.go:
+      #
+      #   Command: "$relPwd ${config.CcWrapper}$ccCmd -c ..."
+      #
+      # and CcWrapper is ctx.Config().Getenv("CC_WRAPPER"). build/make/core/
+      # ccache.mk still sets a *make* variable called CC_WRAPPER, but soong
+      # never sees make variables, so that path is dead. CC_WRAPPER has to be
+      # exported into the environment, which the Build step does.
+      #
+      # CCACHE_DIR has to live under github.workspace or the cache action
+      # cannot see it.
       USE_CCACHE: "1"
       CCACHE_DIR: ${{ github.workspace }}/.ccache
       CCACHE_MAXSIZE: 4G
@@ -377,6 +389,9 @@ jobs:
           if command -v ccache >/dev/null 2>&1; then
             export USE_CCACHE=1
             export CCACHE_EXEC="$(command -v ccache)"
+            # The variable soong actually reads (cc/builder.go). Without it
+            # every clang call goes straight to clang and the cache stays empty.
+            export CC_WRAPPER="${CCACHE_EXEC}"
             mkdir -p "${CCACHE_DIR}"
             ccache -M "${CCACHE_MAXSIZE}" >/dev/null 2>&1 || true
             ccache -z >/dev/null 2>&1 || true
@@ -384,7 +399,7 @@ jobs:
             du -sh "${CCACHE_DIR}" 2>/dev/null || true
           else
             echo "::warning::ccache is not installed; building without a compiler cache"
-            unset USE_CCACHE CCACHE_EXEC
+            unset USE_CCACHE CCACHE_EXEC CC_WRAPPER
           fi
 
           # -------------------------------------------------------------------
@@ -755,12 +770,14 @@ jobs:
           fi
           exit "$rc"
 
-      # Saved even when the build fails. ccache is the only thing that makes a
-      # failed attempt cheaper than the last one, and the runner only runs steps
-      # when it is still alive -- which is exactly the distinction that has been
-      # making these failures so expensive.
+      # Saved even when the build fails, and even when an older cache was
+      # restored. The old condition skipped the save whenever the restore hit,
+      # which meant the cache could only ever hold whatever the very first
+      # successful save contained -- every later run restored it, compiled with
+      # it, and then threw its own results away. The key carries the run id, so
+      # each save is a new entry and the restore-key prefix picks the newest.
       - name: Save compiler cache
-        if: always() && steps.ccache_restore.outputs.cache-hit != 'true'
+        if: always()
         uses: actions/cache/save@v4
         with:
           path: ${{ env.CCACHE_DIR }}
