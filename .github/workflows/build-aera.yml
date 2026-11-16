@@ -53,9 +53,6 @@ concurrency:
 
 permissions:
   contents: write
-  # The resource sampler publishes to a check run, because that is stored on
-  # GitHub and therefore survives the runner that writes it.
-  checks: write
 
 jobs:
   build:
@@ -346,7 +343,6 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           cat > /tmp/telemetry.py <<'PY'
-          import datetime
           import json
           import os
           import subprocess
@@ -360,12 +356,14 @@ jobs:
           API = "https://api.github.com"
 
 
-          def call(path, method="GET", payload=None):
-              data = json.dumps(payload).encode() if payload is not None else None
+          def post(text):
+              """Post a commit comment. Verified to work with contents:write,
+              which is all the workflow token needs -- a check run would need a
+              GitHub App and cannot be tested from outside."""
               req = urllib.request.Request(
-                  API + path,
-                  data=data,
-                  method=method,
+                  API + "/repos/%s/commits/%s/comments" % (REPO, SHA),
+                  data=json.dumps({"body": text}).encode(),
+                  method="POST",
                   headers={
                       "Authorization": "Bearer " + TOKEN,
                       "Accept": "application/vnd.github+json",
@@ -387,34 +385,15 @@ jobs:
                   return "err:%s" % e
 
 
-          check = None
-          try:
-              check = call(
-                  "/repos/%s/check-runs" % REPO,
-                  "POST",
-                  {
-                      "name": "resource telemetry",
-                      "head_sha": SHA,
-                      "status": "in_progress",
-                      "started_at": datetime.datetime.now(
-                          datetime.timezone.utc
-                      ).strftime("%Y-%m-%dT%H:%M:%SZ"),
-                      "output": {"title": "sampling", "summary": "starting"},
-                  },
-              )["id"]
-              with open("/tmp/telemetry.check", "w") as fh:
-                  fh.write(str(check))
-              print("check run", check, flush=True)
-          except Exception as e:
-              print("check run creation failed:", e, flush=True)
-
           lines = []
           t0 = time.time()
           n = 0
           out = "?"
+          # First sample immediately, then every 30s; publish every 2 minutes so
+          # the last comment is never more than 120s stale.
           while True:
               el = int(time.time() - t0)
-              disk = sh("df -h / | tail -1 | awk '{print $3\" used, \"$4\" avail, \"$5\"}'")
+              disk = sh("df -h / | tail -1 | awk '{print $3\" used, \"$4\" avail, \"$5}'")
               mem = sh("free -m | awk '/^Mem:/{print $3\"/\"$2\" MB\"}'")
               swp = sh("free -m | awk '/^Swap:/{print $3\"/\"$2\" MB\"}'")
               load = sh("cut -d' ' -f1-3 /proc/loadavg")
@@ -422,39 +401,28 @@ jobs:
                   "ps -eo rss,comm --sort=-rss | sed -n '2,4p' "
                   "| awk '{printf \"%s=%dM \", $2, $1/1024}'"
               )
-              # du on out/ is real I/O; once every five minutes is enough.
               if n % 10 == 0:
                   out = sh("du -sh '%s/out' 2>/dev/null | cut -f1" % WORKDIR) or "?"
               lines.append(
                   "t+%5ds | disk %s | out %s | mem %s | swap %s | load %s | %s"
                   % (el, disk, out, mem, swp, load, top)
               )
-              lines = lines[-80:]
+              lines = lines[-60:]
               n += 1
-              if check:
+              if n == 1 or n % 4 == 0:
                   try:
-                      call(
-                          "/repos/%s/check-runs/%d" % (REPO, check),
-                          "PATCH",
-                          {
-                              "status": "in_progress",
-                              "output": {
-                                  "title": "t+%ds" % el,
-                                  "summary": "```\n" + "\n".join(lines) + "\n```",
-                              },
-                          },
+                      post(
+                          "**build telemetry** (job %s, run %s)\n\n```\n%s\n```\n"
+                          % (os.environ.get("GITHUB_RUN_ID", "?"), el, "\n".join(lines))
                       )
-                  except Exception:
-                      pass
+                  except Exception as e:
+                      print("post failed:", e, flush=True)
               time.sleep(30)
           PY
           setsid nohup python3 -u /tmp/telemetry.py > /tmp/telemetry.log 2>&1 &
           sleep 4
           cat /tmp/telemetry.log || true
 
-      # A runner with a full disk cannot upload its log, so it just vanishes.
-      # Killing the build while there is still room turns that invisible death
-      # into an ordinary failure with a log, which is worth more than the build.
       - name: Start disk watchdog
         run: |
           cat > /tmp/diskwatch.sh <<'SH'
@@ -726,42 +694,38 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           pkill -f telemetry.py || true
-          tail -5 /tmp/telemetry.log 2>/dev/null || true
           df -h / || true
           free -h || true
+          # If this comment exists, the runner was still alive when Build ended.
+          # If the newest telemetry comment has no successor, that timestamp is
+          # when the runner stopped answering -- which is the whole point.
           python3 - <<'PY' || true
           import json
           import os
           import urllib.request
 
           try:
-              cid = open("/tmp/telemetry.check").read().strip()
-          except Exception:
-              raise SystemExit(0)
-          payload = {
-              "status": "completed",
-              "conclusion": "neutral",
-              "output": {
-                  "title": "telemetry stopped",
-                  "summary": "The samples above are the last ones the runner "
-                  "managed to publish. If this check run ends mid-build while "
-                  "the job says 'lost communication', that sample is the state "
-                  "at the moment the runner stopped answering.",
-              },
-          }
-          req = urllib.request.Request(
-              "https://api.github.com/repos/%s/check-runs/%s"
-              % (os.environ["GITHUB_REPOSITORY"], cid),
-              data=json.dumps(payload).encode(),
-              method="PATCH",
-              headers={
-                  "Authorization": "Bearer " + os.environ["GITHUB_TOKEN"],
-                  "Accept": "application/vnd.github+json",
-                  "User-Agent": "aera-telemetry",
-                  "Content-Type": "application/json",
-              },
-          )
-          urllib.request.urlopen(req, timeout=30).read()
+              req = urllib.request.Request(
+                  "https://api.github.com/repos/%s/commits/%s/comments"
+                  % (os.environ["GITHUB_REPOSITORY"], os.environ["GITHUB_SHA"]),
+                  data=json.dumps(
+                      {
+                          "body": "**telemetry stopped** -- the runner was still "
+                          "alive when Build ended, so the newest sample above is "
+                          "not a death snapshot."
+                      }
+                  ).encode(),
+                  method="POST",
+                  headers={
+                      "Authorization": "Bearer " + os.environ["GITHUB_TOKEN"],
+                      "Accept": "application/vnd.github+json",
+                      "User-Agent": "aera-telemetry",
+                      "Content-Type": "application/json",
+                  },
+              )
+              urllib.request.urlopen(req, timeout=30).read()
+          except Exception as e:
+              print("stop comment failed:", e)
           PY
 
       # ---------------------------------------------------------------------
