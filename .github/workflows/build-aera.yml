@@ -341,27 +341,28 @@ jobs:
       # ---------------------------------------------------------------------
       # Build
       # ---------------------------------------------------------------------
-      # GOGC/GOMEMLIMIT/GOMAXPROCS keep Soong's Go heap inside the runner's
-      # RAM. Measured on this exact runner class (16 GB) by ILYESwsa's F11
-      # workflow: soong_build was OOM-killed at ~13.6 GB RSS.
+      # GOGC/GOMEMLIMIT/GOMAXPROCS bound Soong's Go heap.
       #
-      # 11 GiB plus 30 GB of swap is the combination that has actually produced
-      # a green image here (run #7), so it is what this uses. It is a soft
-      # limit and the analysis genuinely needs ~14 GB, so the limit is not what
-      # keeps it alive -- the swap is.
+      # These were 40 / 11GiB / 2, copied from ILYESwsa's F11 workflow. The
+      # sampler in run 43851152934 showed that 11GiB is *below* what this tree's
+      # analysis needs: soong_build sat at 12.2-13.9 GB RSS for 41 straight
+      # minutes, swap climbed to 19.6 GB, and not one clang process ever
+      # started. That is the Go runtime in its "cannot reach the soft limit"
+      # mode -- when the live heap is above GOMEMLIMIT, GC runs back to back
+      # forever, and the analysis crawls instead of finishing.
       #
-      # 6 GiB was tried and is not what failed (the deaths did not move), but it
-      # only makes the GC burn CPU it cannot save: at 14 GB live there is
-      # nothing to collect. Do not lower it again expecting a memory win.
+      # So the limit is now set *above* the observed working set instead of
+      # below it (14 GiB clears the sustained 12.2-13.9 GB, and leaves ~1 GB
+      # for the OS on a 15.6 GiB box). A normal GC cadence that occasionally
+      # swaps is better than a permanent GC spiral that never reaches the
+      # compiler at all. GOGC and GOMAXPROCS keep the values from the one green
+      # run; only the ceiling moves.
       - name: Build
         env:
           GOGC: "40"
-          GOMEMLIMIT: "11GiB"
+          GOMEMLIMIT: "14GiB"
           GOMAXPROCS: "2"
           ALLOW_MISSING_DEPENDENCIES: "true"
-          # Raise this once the wall is understood; 1500 s is chosen to end the
-          # step well before the ~47 minute point where the runner dies.
-          BUILD_BUDGET_SEC: "1500"
           # The sampler inside this step posts commit comments, and the token
           # is not exported automatically -- it has to be named here or the
           # sampler dies on KeyError at startup and we are blind again.
@@ -596,37 +597,25 @@ jobs:
           # module the build already produces. Its assertions moved to after
           # the build, where the artefact actually exists.
           set +e
-          # The runner dies ~47 minutes into this step, five times out of five,
-          # and it takes its log and its ccache with it. Ending the step before
-          # that point is the only way to finish the job normally -- and a job
-          # that finishes normally is the only kind that uploads a log and
-          # saves a cache. Soong is invoked directly because `mka` is a shell
-          # function and `timeout` cannot exec a function.
+          # Run the build to completion, the way AzzyC's builder does. There
+          # used to be a `timeout` budget here, to end the step before a
+          # supposed wall at ~47 minutes so that ccache would survive. It was
+          # wrong in three ways:
           #
-          # 1500 s of compilation plus ~9 minutes of soong analysis (two
-          # invocations: libaera_boot_trim, then this one) keeps the whole step
-          # near 34 minutes, which leaves real margin under the wall.
-          BUILD_BUDGET_SEC="${BUILD_BUDGET_SEC:-1500}"
-          echo "build budget: ${BUILD_BUDGET_SEC}s"
-          # One deadline for the whole step, not one per attempt: the retry
-          # below must not be handed a fresh 1500 s, or two attempts would add
-          # up to ~59 minutes and walk straight into the wall the budget exists
-          # to stay under.
-          DEADLINE=$(( $(date +%s) + BUILD_BUDGET_SEC ))
-          build_within_budget() {
-            local remain=$(( DEADLINE - $(date +%s) ))
-            if [ "${remain}" -lt 60 ]; then remain=60; fi
-            echo "--- building (${remain}s of budget left): $*"
-            timeout --signal=INT --kill-after=120 "${remain}" \
-              build/soong/soong_ui.bash --make-mode "$@"
-          }
-          build_within_budget adbd "${BUILD_TARGET}"
+          #   1. A dead runner never saves a cache anyway, so it could not
+          #      protect the thing it existed to protect.
+          #   2. It ended run 43851152934 at 25 minutes having compiled nothing
+          #      at all -- soong analysis alone ran past 41 minutes on this box,
+          #      so every chained successor re-analysed forever and produced not
+          #      one object file.
+          #   3. `timeout` signalled the soong_ui.bash wrapper, not the
+          #      soong_build child. soong_build kept running as an orphan and
+          #      the step hung until the run was cancelled by hand.
+          #
+          # The job's own timeout-minutes is the guard against a hang.
+          build/soong/soong_ui.bash --make-mode adbd "${BUILD_TARGET}"
           rc=$?
-          if [ "$rc" -eq 124 ] || [ "$rc" -eq 130 ]; then
-            touch /tmp/budget_stop
-            echo "::warning::stopped by the ${BUILD_BUDGET_SEC}s budget, not by an error"
-            echo "::warning::this run banks its ccache and uploads its log; the next one resumes further along"
-          elif [ "$rc" -ne 0 ]; then
+          if [ "$rc" -ne 0 ]; then
             if [ -e /tmp/diskfull ]; then
               # The watchdog already killed this build on purpose. Retrying
               # would either die the same way or spend the budget compiling
@@ -637,7 +626,7 @@ jobs:
               # If the boot rule is unavailable on this tree, recoveryimage
               # still produces a flashable image.
               echo "--- ${BUILD_TARGET} failed (rc=$rc), retrying with recoveryimage"
-              build_within_budget adbd recoveryimage
+              build/soong/soong_ui.bash --make-mode adbd recoveryimage
               rc=$?
             fi
           fi
