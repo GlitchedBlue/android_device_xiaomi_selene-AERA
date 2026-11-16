@@ -77,10 +77,16 @@ jobs:
       - name: Cleanup
         uses: rokibhasansagar/slimhub_actions@main
 
+      # slimhub frees the preinstalled toolchains, which is where the ~110 GB of
+      # free space at the start comes from. The swap file is carved out of that
+      # same disk, so its size is not free: a 30 GB file plus the ~35 GB source
+      # tree plus a full out/ is what the build has to fit in. Four builds died
+      # at a fixed point with the runner vanishing and no log, so the file is
+      # down to 8 GB -- enough to cover a spike, but 22 GB returned to out/.
       - name: Set swap space
         uses: pierotofy/set-swap-space@master
         with:
-          swap-size-gb: 30
+          swap-size-gb: 8
 
       - name: Show resources
         run: |
@@ -308,7 +314,8 @@ jobs:
       #
       # 6 GiB gives soong_build plenty (this tree needs 2-4 GiB) and leaves the
       # rest for clang. -j3 on mka does the same for the compilers, which is
-      # the other half of the peak.
+      # the other half of the peak. This did NOT stop the deaths, so memory is
+      # not the cause; it is kept because it is cheap and it is not wrong.
       - name: Build
         env:
           GOGC: "40"

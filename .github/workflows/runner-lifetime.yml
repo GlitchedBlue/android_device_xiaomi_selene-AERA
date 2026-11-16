@@ -1,0 +1,45 @@
+# How long does one hosted runner actually stay alive?
+#
+# The image build keeps dying at 46-48 minutes with "the hosted runner lost
+# communication with the server" and no log (the blob is never uploaded). That
+# is the same signature as a resource death, but it is also what a hard job
+# limit would look like, and the two need completely different fixes:
+#
+#   hard limit  -> the build has to be split across jobs (chunking)
+#   resources   -> the build has to use less memory or disk
+#
+# Four builds died at 59, 60, 60 and 62 minutes of job time. Two of those
+# totals were 3601 seconds, which a resource death would not reproduce to the
+# second, so a limit is the leading theory. This job does nothing but sleep and
+# print a heartbeat, so if it dies at ~60 minutes the limit is real and has
+# nothing to do with what the build does.
+#
+# Deliberately not in the build workflow's paths filter, so pushing this file
+# does not start an image build.
+name: runner lifetime probe
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    name: Sleep for 95 minutes and report
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    steps:
+      - name: Heartbeat
+        run: |
+          start=$(date +%s)
+          for i in $(seq 1 95); do
+            now=$(date +%s)
+            printf 'alive %4ds  utc=%s  mem_used=%s  disk_avail=%s\n' \
+              "$((now - start))" \
+              "$(date -u +%H:%M:%S)" \
+              "$(free -m | awk '/^Mem:/{print $3 "M"}')" \
+              "$(df -h / | awk 'NR==2{print $4}')"
+            sleep 60
+          done
+          echo "PROBE SURVIVED 95 MINUTES"
