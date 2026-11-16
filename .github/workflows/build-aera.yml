@@ -761,7 +761,16 @@ jobs:
           #      the step hung until the run was cancelled by hand.
           #
           # The job's own timeout-minutes is the guard against a hang.
-          build/soong/soong_ui.bash --make-mode adbd "${BUILD_TARGET}"
+          # The gralloc1 shim is in PRODUCT_PACKAGES, but PRODUCT_PACKAGES only
+          # feeds the system/vendor images -- `bootimage` never pulls those in,
+          # so the module has to be named on the command line or it is simply
+          # never built. That is exactly what failed in run 43899667091: the
+          # build itself was green (rc=0, images collected) and only the
+          # assertion below caught the missing .so.
+          #
+          # Building it here costs nothing extra: soong has already analysed the
+          # tree, so this is one more ninja edge, not a second analysis.
+          build/soong/soong_ui.bash --make-mode adbd "${BUILD_TARGET}" libaera_gralloc1
           rc=$?
           if [ "$rc" -ne 0 ]; then
             if [ -e /tmp/diskfull ]; then
@@ -774,7 +783,7 @@ jobs:
               # If the boot rule is unavailable on this tree, recoveryimage
               # still produces a flashable image.
               echo "--- ${BUILD_TARGET} failed (rc=$rc), retrying with recoveryimage"
-              build/soong/soong_ui.bash --make-mode adbd recoveryimage
+              build/soong/soong_ui.bash --make-mode adbd recoveryimage libaera_gralloc1
               rc=$?
             fi
           fi
@@ -784,45 +793,46 @@ jobs:
           # The gralloc1 shim assertions, moved here because the module is now
           # produced by mka rather than by a separate `m` invocation.
           #
-          # Only when the build actually finished. A budget stop is a normal
-          # outcome of this workflow (see above) and the shim is one module
-          # among thousands, so it will not exist yet; treating that as "the
-          # shim was not produced" would turn an intentional stop into a
-          # misleading hard failure.
+          # These used to `exit 1` on the first problem, so every failing run
+          # revealed exactly one issue and the checks after it never ran -- each
+          # discovery cost a 90 minute rebuild. They all run now and the step
+          # fails once at the end.
+          FAIL=0
           if [ "$rc" -eq 0 ]; then
             GRALLOC=$(find out/soong/.intermediates "out/target/product/${DEVICE}" \
               -name libaera_gralloc1.so -print -quit 2>/dev/null)
             if [ -z "${GRALLOC}" ]; then
-              echo "::error::libaera_gralloc1.so was not produced, but device.mk puts it in PRODUCT_PACKAGES"
-              exit 1
+              echo "::error::libaera_gralloc1.so was not produced. It is in PRODUCT_PACKAGES, which only feeds the system/vendor images, so 'bootimage' has to name it on the make command line."
+              FAIL=1
+            else
+              echo "gralloc shim built: ${GRALLOC}"
+              if ! readelf -hW "${GRALLOC}" | grep -q 'AArch64'; then
+                echo "::error::libaera_gralloc1.so is not an AArch64 object"
+                readelf -hW "${GRALLOC}" || true
+                FAIL=1
+              fi
+              # dlsym(HAL_MODULE_INFO_SYM_AS_STR) is how mali_display.cpp finds
+              # the module, so a hidden symbol would make the HAL invisible. Note
+              # the name: hardware.h defines HAL_MODULE_INFO_SYM as HMI, and
+              # HAL_MODULE_INFO_SYM_AS_STR as "HMI" -- grepping for the macro
+              # name matches nothing at all.
+              if ! readelf --dyn-syms -W "${GRALLOC}" | grep -qE 'OBJECT +GLOBAL +DEFAULT +[0-9]+ HMI$'; then
+                echo "::error::libaera_gralloc1.so does not export HMI (HAL_MODULE_INFO_SYM)"
+                readelf --dyn-syms -W "${GRALLOC}" || true
+                FAIL=1
+              fi
+              # The private namespace is linked to the recovery process for
+              # exactly libc/libm/libdl. Any other DT_NEEDED would have to be
+              # staged into the blob store as well, so fail loudly instead of
+              # shipping a shim that cannot resolve.
+              if readelf -dW "${GRALLOC}" | grep NEEDED | grep -Ev 'libc\.so|libm\.so|libdl\.so'; then
+                echo "::error::libaera_gralloc1.so depends on a library the Mali namespace does not share"
+                FAIL=1
+              fi
+              mkdir -p "${GITHUB_WORKSPACE}/artifacts"
+              cp -f "${GRALLOC}" "${GITHUB_WORKSPACE}/artifacts/gralloc.mt6768.so"
+              ls -l "${GITHUB_WORKSPACE}/artifacts/gralloc.mt6768.so"
             fi
-            echo "gralloc shim built: ${GRALLOC}"
-            if ! readelf -hW "${GRALLOC}" | grep -q 'AArch64'; then
-              echo "::error::libaera_gralloc1.so is not an AArch64 object"
-              readelf -hW "${GRALLOC}" || true
-              exit 1
-            fi
-            # dlsym(HAL_MODULE_INFO_SYM_AS_STR) is how mali_display.cpp finds
-            # the module, so a hidden symbol would make the HAL invisible. Note
-            # the name: hardware.h defines HAL_MODULE_INFO_SYM as HMI, and
-            # HAL_MODULE_INFO_SYM_AS_STR as "HMI" -- grepping for the macro
-            # name matches nothing at all.
-            if ! readelf --dyn-syms -W "${GRALLOC}" | grep -qE 'OBJECT +GLOBAL +DEFAULT +[0-9]+ HMI$'; then
-              echo "::error::libaera_gralloc1.so does not export HMI (HAL_MODULE_INFO_SYM)"
-              readelf --dyn-syms -W "${GRALLOC}" || true
-              exit 1
-            fi
-            # The private namespace is linked to the recovery process for
-            # exactly libc/libm/libdl. Any other DT_NEEDED would have to be
-            # staged into the blob store as well, so fail loudly instead of
-            # shipping a shim that cannot resolve.
-            if readelf -dW "${GRALLOC}" | grep NEEDED | grep -Ev 'libc\.so|libm\.so|libdl\.so'; then
-              echo "::error::libaera_gralloc1.so depends on a library the Mali namespace does not share"
-              exit 1
-            fi
-            mkdir -p "${GITHUB_WORKSPACE}/artifacts"
-            cp -f "${GRALLOC}" "${GITHUB_WORKSPACE}/artifacts/gralloc.mt6768.so"
-            ls -l "${GITHUB_WORKSPACE}/artifacts/gralloc.mt6768.so"
           else
             echo "::notice::build did not finish (rc=${rc}); skipping the gralloc1 shim assertions"
           fi
@@ -837,7 +847,7 @@ jobs:
             if [ -z "${SHIM_IN_ROOT}" ]; then
               echo "::error::libaera_boot_trim.so is missing from the staged recovery root; the ramdisk would ship without the boot-HAL shim"
               find "out/target/product/${DEVICE}" -maxdepth 2 -type d 2>/dev/null | head -40 || true
-              rc=1
+              FAIL=1
             else
               echo "boot-HAL shim staged at: ${SHIM_IN_ROOT}"
               readelf -sW "${SHIM_IN_ROOT}" | grep -i trim || true
@@ -849,11 +859,11 @@ jobs:
               -path '*recovery/root/system/etc/init/android.hardware.boot@1.2-service.rc' -print -quit 2>/dev/null)
             if [ -z "${BOOTRC_IN_ROOT}" ]; then
               echo "::error::boot HAL .rc override is missing from the staged recovery root; the shim would never be preloaded"
-              rc=1
+              FAIL=1
             elif ! grep -q 'setenv LD_PRELOAD /sbin/libaera_boot_trim.so' "${BOOTRC_IN_ROOT}"; then
               echo "::error::boot HAL .rc does not setenv LD_PRELOAD /sbin/libaera_boot_trim.so"
               grep -n -A10 'service boot-hal-1-2' "${BOOTRC_IN_ROOT}" || true
-              rc=1
+              FAIL=1
             else
               echo "boot HAL preload staged: ${BOOTRC_IN_ROOT}"
             fi
@@ -866,11 +876,11 @@ jobs:
               -path '*recovery/root/vendor/etc/vintf/manifest.xml' -print -quit 2>/dev/null)
             if [ -z "${MANIFEST_IN_ROOT}" ]; then
               echo "::error::vendor VINTF manifest is missing from the staged recovery root"
-              rc=1
+              FAIL=1
             elif ! grep -q '@1.2::IBootControl/default' "${MANIFEST_IN_ROOT}"; then
               echo "::error::staged vendor manifest does not declare @1.2::IBootControl/default; the boot HAL would be refused and recovery would block"
               grep -n -A8 'android.hardware.boot' "${MANIFEST_IN_ROOT}" || true
-              rc=1
+              FAIL=1
             else
               echo "manifest declares boot@1.2: ${MANIFEST_IN_ROOT}"
               grep -n 'IBootControl/default' "${MANIFEST_IN_ROOT}" || true
@@ -884,10 +894,10 @@ jobs:
                 -path "*recovery/root/system/bin/${script}" -print -quit 2>/dev/null)
               if [ -z "${STAGED}" ]; then
                 echo "::error::${script} is missing from the staged recovery root"
-                rc=1
+                FAIL=1
               elif [ ! -x "${STAGED}" ]; then
                 echo "::error::${script} is not executable in the staged recovery root"
-                rc=1
+                FAIL=1
               else
                 echo "gpu script staged: ${STAGED}"
               fi
@@ -900,6 +910,12 @@ jobs:
             echo "=== ccache statistics ==="
             ccache -s || true
             du -sh "${CCACHE_DIR}" 2>/dev/null || true
+          fi
+          # All assertions have run by now; fail the step once, at the end, so a
+          # single run reports every problem instead of the first one.
+          if [ "${FAIL:-0}" -ne 0 ]; then
+            echo "::error::build assertions failed; see the errors above"
+            rc=1
           fi
           exit "$rc"
 
