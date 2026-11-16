@@ -1026,6 +1026,31 @@ Run #7 measured, for future reference: 148 min wall, of which `Cleanup` 4.4,
 | #5 `43586256262` | cancelled | — | superseded before the manifest-only image was built; the scoped-preload fix went in instead |
 | #6 `43629463339` | cancelled | — | Mali integration commit; cancelled on request to free the runner for OrangeFox testing |
 | #7 `43635914131` | **success**, 148 min | image published | first image with the Mali backend compiled in (dormant: no gralloc1); every assertion passed |
+| #8 `43774984519` | failure, 60 min | `Build` at ~37 min | runner lost communication; log blob never uploaded |
+| #9 `43782632428` | failure, 60 min | `Build` at ~37 min | same |
+| #10 `43788533915` | failure, 62 min | `Build` at ~36 min | same |
+
+### The runner dies ~37 minutes into `Build` (2026-11-16)
+
+Three consecutive builds died the same way: the job ends as `failure` with the
+step still `in_progress`, the annotation reads *"The hosted runner lost
+communication with the server"*, and `GET /actions/jobs/<id>/logs` answers 404
+because the runner never got to upload anything. GitHub is also late by about
+ten minutes, so a job reported at 60:01 actually died at ~50:00, which is ~37
+minutes into `Build` each time — deterministic, not a flake.
+
+That signature is resource starvation of the runner agent, not a compile error.
+`GOMEMLIMIT` was `11GiB` on a 15 GiB machine, which keeps `soong_build` alive
+but leaves the four parallel compilers nothing but swap; the VM thrashes,
+`Runner.Listener` stops answering, and the job is declared lost. It is now
+`6GiB` (this tree's soong_build needs 2-4 GiB) and `mka` runs `-j3`, which caps
+the other half of the peak. A build that dies costs two and a half hours; the
+parallelism cap costs minutes.
+
+Do not "fix" this by raising `GOMEMLIMIT` again, and do not conclude the patch
+is broken when the log is missing — check
+`GET /repos/<repo>/check-runs/<job-id>/annotations` first, since that is the
+only thing that survives a dead runner.
 
 ## Next time you sit down
 

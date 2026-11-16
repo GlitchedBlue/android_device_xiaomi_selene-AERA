@@ -294,13 +294,25 @@ jobs:
       # ---------------------------------------------------------------------
       # GOGC/GOMEMLIMIT/GOMAXPROCS keep Soong's Go heap inside the runner's
       # RAM. Measured on this exact runner class (16 GB) by ILYESwsa's F11
-      # workflow: soong_build was OOM-killed at ~13.6 GB RSS. 11 GiB plus the
-      # 30 GB swap above is the combination that survives; 12 GiB does not
-      # leave enough for the compilers.
+      # workflow: soong_build was OOM-killed at ~13.6 GB RSS.
+      #
+      # 11 GiB was the old value and it does keep soong_build alive, but three
+      # consecutive builds then died about 37 minutes into this step with
+      # "the hosted runner lost communication with the server" and no log at
+      # all (the blob never gets uploaded when the runner dies, so the failure
+      # is only visible as an annotation). That signature is resource
+      # starvation of the runner agent, and a 11 GiB soft target on a 15 GiB
+      # machine leaves the four parallel compilers nothing but swap: the VM
+      # thrashes, Runner.Listener stops answering, and GitHub reports the job
+      # dead ten minutes later than it actually died.
+      #
+      # 6 GiB gives soong_build plenty (this tree needs 2-4 GiB) and leaves the
+      # rest for clang. -j3 on mka does the same for the compilers, which is
+      # the other half of the peak.
       - name: Build
         env:
           GOGC: "40"
-          GOMEMLIMIT: "11GiB"
+          GOMEMLIMIT: "6GiB"
           GOMAXPROCS: "2"
           ALLOW_MISSING_DEPENDENCIES: "true"
         run: |
@@ -397,7 +409,10 @@ jobs:
           ls -l "${GITHUB_WORKSPACE}/artifacts/gralloc.mt6768.so"
 
           set +e
-          mka adbd "${BUILD_TARGET}"
+          # -j3, not the runner's four cores: see the note above the step. The
+          # cap is about peak memory, and the runner dying costs the whole
+          # build whereas the extra parallelism only saves minutes.
+          mka adbd "${BUILD_TARGET}" -j3
           rc=$?
 
           # selene is recovery-as-boot, so bootimage is the normal target.
@@ -405,7 +420,7 @@ jobs:
           # produces a flashable image.
           if [ "$rc" -ne 0 ] || ! ls out/target/product/${DEVICE}/*.img >/dev/null 2>&1; then
             echo "--- ${BUILD_TARGET} failed (rc=$rc), retrying with recoveryimage"
-            mka adbd recoveryimage
+            mka adbd recoveryimage -j3
             rc=$?
           fi
 
