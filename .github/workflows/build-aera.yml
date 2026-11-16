@@ -53,6 +53,9 @@ concurrency:
 
 permissions:
   contents: write
+  # The resource sampler publishes to a check run, because that is stored on
+  # GitHub and therefore survives the runner that writes it.
+  checks: write
 
 jobs:
   build:
@@ -296,6 +299,156 @@ jobs:
           df -h .
 
       # ---------------------------------------------------------------------
+      # Instruments that survive the runner
+      # ---------------------------------------------------------------------
+      # Five builds have now died with "the hosted runner lost communication
+      # with the server", the step frozen in_progress and the log blob 404.
+      # That combination is what a runner that cannot write its own log looks
+      # like -- i.e. a full disk -- and it is also why guessing has been
+      # useless: the one number that matters (free space at the moment of
+      # death) is the one number the dead runner never reports.
+      #
+      # A check run lives on GitHub, not on the runner, so the last PATCH a
+      # dying runner managed to send is still readable afterwards. This samples
+      # disk/memory/swap/load every 30s and publishes the last 80 samples.
+      - name: Start resource telemetry
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cat > /tmp/telemetry.py <<'PY'
+          import datetime
+          import json
+          import os
+          import subprocess
+          import time
+          import urllib.request
+
+          TOKEN = os.environ["GITHUB_TOKEN"]
+          REPO = os.environ["GITHUB_REPOSITORY"]
+          SHA = os.environ["GITHUB_SHA"]
+          WORKDIR = os.environ.get("WORKDIR", ".")
+          API = "https://api.github.com"
+
+
+          def call(path, method="GET", payload=None):
+              data = json.dumps(payload).encode() if payload is not None else None
+              req = urllib.request.Request(
+                  API + path,
+                  data=data,
+                  method=method,
+                  headers={
+                      "Authorization": "Bearer " + TOKEN,
+                      "Accept": "application/vnd.github+json",
+                      "User-Agent": "aera-telemetry",
+                      "Content-Type": "application/json",
+                  },
+              )
+              with urllib.request.urlopen(req, timeout=30) as r:
+                  return json.loads(r.read().decode() or "{}")
+
+
+          def sh(cmd):
+              try:
+                  p = subprocess.run(
+                      ["bash", "-lc", cmd], capture_output=True, text=True, timeout=25
+                  )
+                  return (p.stdout or p.stderr).strip().replace("\n", " ")
+              except Exception as e:
+                  return "err:%s" % e
+
+
+          check = None
+          try:
+              check = call(
+                  "/repos/%s/check-runs" % REPO,
+                  "POST",
+                  {
+                      "name": "resource telemetry",
+                      "head_sha": SHA,
+                      "status": "in_progress",
+                      "started_at": datetime.datetime.now(
+                          datetime.timezone.utc
+                      ).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                      "output": {"title": "sampling", "summary": "starting"},
+                  },
+              )["id"]
+              with open("/tmp/telemetry.check", "w") as fh:
+                  fh.write(str(check))
+              print("check run", check, flush=True)
+          except Exception as e:
+              print("check run creation failed:", e, flush=True)
+
+          lines = []
+          t0 = time.time()
+          n = 0
+          out = "?"
+          while True:
+              el = int(time.time() - t0)
+              disk = sh("df -h / | tail -1 | awk '{print $3\" used, \"$4\" avail, \"$5\"}'")
+              mem = sh("free -m | awk '/^Mem:/{print $3\"/\"$2\" MB\"}'")
+              swp = sh("free -m | awk '/^Swap:/{print $3\"/\"$2\" MB\"}'")
+              load = sh("cut -d' ' -f1-3 /proc/loadavg")
+              top = sh(
+                  "ps -eo rss,comm --sort=-rss | sed -n '2,4p' "
+                  "| awk '{printf \"%s=%dM \", $2, $1/1024}'"
+              )
+              # du on out/ is real I/O; once every five minutes is enough.
+              if n % 10 == 0:
+                  out = sh("du -sh '%s/out' 2>/dev/null | cut -f1" % WORKDIR) or "?"
+              lines.append(
+                  "t+%5ds | disk %s | out %s | mem %s | swap %s | load %s | %s"
+                  % (el, disk, out, mem, swp, load, top)
+              )
+              lines = lines[-80:]
+              n += 1
+              if check:
+                  try:
+                      call(
+                          "/repos/%s/check-runs/%d" % (REPO, check),
+                          "PATCH",
+                          {
+                              "status": "in_progress",
+                              "output": {
+                                  "title": "t+%ds" % el,
+                                  "summary": "```\n" + "\n".join(lines) + "\n```",
+                              },
+                          },
+                      )
+                  except Exception:
+                      pass
+              time.sleep(30)
+          PY
+          setsid nohup python3 -u /tmp/telemetry.py > /tmp/telemetry.log 2>&1 &
+          sleep 4
+          cat /tmp/telemetry.log || true
+
+      # A runner with a full disk cannot upload its log, so it just vanishes.
+      # Killing the build while there is still room turns that invisible death
+      # into an ordinary failure with a log, which is worth more than the build.
+      - name: Start disk watchdog
+        run: |
+          cat > /tmp/diskwatch.sh <<'SH'
+          #!/bin/bash
+          while true; do
+            avail=$(df --output=avail -m / | tail -1 | tr -d ' ')
+            if [ "${avail}" -lt 2048 ]; then
+              echo "::error::disk nearly full (${avail} MB free) - aborting before the runner dies"
+              df -h /
+              du -sh "${WORKDIR}" 2>/dev/null | tail -1
+              du -sh "${WORKDIR}/out" 2>/dev/null | tail -1
+              du -sh "${WORKDIR}"/out/* 2>/dev/null | sort -h | tail -10
+              pkill -f soong_ui || true
+              pkill -f ninja || true
+              exit 1
+            fi
+            sleep 10
+          done
+          SH
+          chmod +x /tmp/diskwatch.sh
+          setsid nohup /tmp/diskwatch.sh > /tmp/diskwatch.log 2>&1 &
+          echo "watchdog armed at $(df -h / | tail -1 | awk '{print $4}') free"
+
+      # ---------------------------------------------------------------------
       # Build
       # ---------------------------------------------------------------------
       # GOGC/GOMEMLIMIT/GOMAXPROCS keep Soong's Go heap inside the runner's
@@ -502,6 +655,50 @@ jobs:
           df -h .
           free -h
           exit "$rc"
+
+      - name: Stop resource telemetry
+        if: always()
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          pkill -f telemetry.py || true
+          tail -5 /tmp/telemetry.log 2>/dev/null || true
+          df -h / || true
+          free -h || true
+          python3 - <<'PY' || true
+          import json
+          import os
+          import urllib.request
+
+          try:
+              cid = open("/tmp/telemetry.check").read().strip()
+          except Exception:
+              raise SystemExit(0)
+          payload = {
+              "status": "completed",
+              "conclusion": "neutral",
+              "output": {
+                  "title": "telemetry stopped",
+                  "summary": "The samples above are the last ones the runner "
+                  "managed to publish. If this check run ends mid-build while "
+                  "the job says 'lost communication', that sample is the state "
+                  "at the moment the runner stopped answering.",
+              },
+          }
+          req = urllib.request.Request(
+              "https://api.github.com/repos/%s/check-runs/%s"
+              % (os.environ["GITHUB_REPOSITORY"], cid),
+              data=json.dumps(payload).encode(),
+              method="PATCH",
+              headers={
+                  "Authorization": "Bearer " + os.environ["GITHUB_TOKEN"],
+                  "Accept": "application/vnd.github+json",
+                  "User-Agent": "aera-telemetry",
+                  "Content-Type": "application/json",
+              },
+          )
+          urllib.request.urlopen(req, timeout=30).read()
+          PY
 
       # ---------------------------------------------------------------------
       # Artifacts
