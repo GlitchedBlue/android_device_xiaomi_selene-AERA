@@ -326,22 +326,72 @@ jobs:
           df -h .
 
       # ---------------------------------------------------------------------
-      # Instruments that survive the runner
+      # Build
       # ---------------------------------------------------------------------
-      # Five builds have now died with "the hosted runner lost communication
-      # with the server", the step frozen in_progress and the log blob 404.
-      # That combination is what a runner that cannot write its own log looks
-      # like -- i.e. a full disk -- and it is also why guessing has been
-      # useless: the one number that matters (free space at the moment of
-      # death) is the one number the dead runner never reports.
+      # GOGC/GOMEMLIMIT/GOMAXPROCS keep Soong's Go heap inside the runner's
+      # RAM. Measured on this exact runner class (16 GB) by ILYESwsa's F11
+      # workflow: soong_build was OOM-killed at ~13.6 GB RSS.
       #
-      # A check run lives on GitHub, not on the runner, so the last PATCH a
-      # dying runner managed to send is still readable afterwards. This samples
-      # disk/memory/swap/load every 30s and publishes the last 80 samples.
-      - name: Start resource telemetry
+      # 11 GiB was the old value and it does keep soong_build alive, but three
+      # consecutive builds then died about 37 minutes into this step with
+      # "the hosted runner lost communication with the server" and no log at
+      # all (the blob never gets uploaded when the runner dies, so the failure
+      # is only visible as an annotation). That signature is resource
+      # starvation of the runner agent, and a 11 GiB soft target on a 15 GiB
+      # machine leaves the four parallel compilers nothing but swap: the VM
+      # thrashes, Runner.Listener stops answering, and GitHub reports the job
+      # dead ten minutes later than it actually died.
+      #
+      # 6 GiB gives soong_build plenty (this tree needs 2-4 GiB) and leaves the
+      # rest for clang. -j3 on mka does the same for the compilers, which is
+      # the other half of the peak. This did NOT stop the deaths, so memory is
+      # not the cause; it is kept because it is cheap and it is not wrong.
+      - name: Build
         env:
+          GOGC: "40"
+          GOMEMLIMIT: "6GiB"
+          GOMAXPROCS: "2"
+          ALLOW_MISSING_DEPENDENCIES: "true"
+          # Raise this once the wall is understood; 1500 s is chosen to end the
+          # step well before the ~47 minute point where the runner dies.
+          BUILD_BUDGET_SEC: "1500"
+          # The sampler inside this step posts commit comments, and the token
+          # is not exported automatically -- it has to be named here or the
+          # sampler dies on KeyError at startup and we are blind again.
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          cd "${WORKDIR}"
+
+          # Compiler cache. Soong only uses ccache when USE_CCACHE and
+          # CCACHE_EXEC are both set in the build's own environment, and -z
+          # zeroes the counters so the stats at the end of this step describe
+          # this run instead of the history of the restored cache.
+          if command -v ccache >/dev/null 2>&1; then
+            export USE_CCACHE=1
+            export CCACHE_EXEC="$(command -v ccache)"
+            mkdir -p "${CCACHE_DIR}"
+            ccache -M "${CCACHE_MAXSIZE}" >/dev/null 2>&1 || true
+            ccache -z >/dev/null 2>&1 || true
+            echo "ccache: ${CCACHE_EXEC} max ${CCACHE_MAXSIZE} dir ${CCACHE_DIR}"
+            du -sh "${CCACHE_DIR}" 2>/dev/null || true
+          else
+            echo "::warning::ccache is not installed; building without a compiler cache"
+            unset USE_CCACHE CCACHE_EXEC
+          fi
+
+          # -------------------------------------------------------------------
+          # Instruments, started here on purpose
+          # -------------------------------------------------------------------
+          # A background process started in an earlier step gets reaped when
+          # that step ends: the first sampler posted at t+0 and t+91s and then
+          # went silent for the remaining 46 minutes of the job. Starting them
+          # inside the step they watch is what makes them live long enough to
+          # be useful.
+          #
+          # Everything here is posted as a commit comment, which lives on
+          # GitHub rather than on the runner. A runner that dies uploads no log
+          # (the blob is 404), so the last comment is the only record of the
+          # state at the moment it stopped answering.
           cat > /tmp/telemetry.py <<'PY'
           import json
           import os
@@ -357,9 +407,6 @@ jobs:
 
 
           def post(text):
-              """Post a commit comment. Verified to work with contents:write,
-              which is all the workflow token needs -- a check run would need a
-              GitHub App and cannot be tested from outside."""
               req = urllib.request.Request(
                   API + "/repos/%s/commits/%s/comments" % (REPO, SHA),
                   data=json.dumps({"body": text}).encode(),
@@ -389,14 +436,20 @@ jobs:
           t0 = time.time()
           n = 0
           out = "?"
-          # First sample immediately, then every 30s; publish every 2 minutes so
-          # the last comment is never more than 120s stale.
           while True:
               el = int(time.time() - t0)
               disk = sh("df -h / | tail -1 | awk '{print $3\" used, \"$4\" avail, \"$5}'")
               mem = sh("free -m | awk '/^Mem:/{print $3\"/\"$2\" MB\"}'")
               swp = sh("free -m | awk '/^Swap:/{print $3\"/\"$2\" MB\"}'")
               load = sh("cut -d' ' -f1-3 /proc/loadavg")
+              # PSI: "some avg10" is the share of time something stalled on
+              # memory. That separates "using a lot" from "thrashing".
+              psi = sh(
+                  "awk '/^some/{printf \"%s %s\", $2, $5}' /proc/pressure/memory "
+                  "2>/dev/null"
+              )
+              procs = sh("ps -e --no-headers | wc -l")
+              fds = sh("cut -d' ' -f1 /proc/sys/fs/file-nr")
               top = sh(
                   "ps -eo rss,comm --sort=-rss | sed -n '2,4p' "
                   "| awk '{printf \"%s=%dM \", $2, $1/1024}'"
@@ -404,35 +457,45 @@ jobs:
               if n % 10 == 0:
                   out = sh("du -sh '%s/out' 2>/dev/null | cut -f1" % WORKDIR) or "?"
               lines.append(
-                  "t+%5ds | disk %s | out %s | mem %s | swap %s | load %s | %s"
-                  % (el, disk, out, mem, swp, load, top)
+                  "t+%5ds | disk %s | out %s | mem %s | swap %s | load %s "
+                  "| psi %s | procs %s | fds %s | %s"
+                  % (el, disk, out, mem, swp, load, psi, procs, fds, top)
               )
-              lines = lines[-60:]
+              # dmesg is the only thing that says outright whether the kernel
+              # OOM-killed something, and which process it picked.
+              if n % 5 == 0:
+                  klog = sh(
+                      "sudo -n dmesg -T 2>/dev/null | tail -4 "
+                      "| tr '\\n' '|' | cut -c1-400"
+                  )
+                  if klog:
+                      lines.append("    klog: " + klog)
+              lines = lines[-40:]
               n += 1
-              if n == 1 or n % 4 == 0:
-                  try:
-                      post(
-                          "**build telemetry** (job %s, run %s)\n\n```\n%s\n```\n"
-                          % (os.environ.get("GITHUB_RUN_ID", "?"), el, "\n".join(lines))
-                      )
-                  except Exception as e:
-                      print("post failed:", e, flush=True)
+              try:
+                  post(
+                      "**build telemetry** #%d pid=%d\n\n```\n%s\n```\n"
+                      % (n, os.getpid(), "\n".join(lines))
+                  )
+              except Exception as e:
+                  print("post failed:", e, flush=True)
               time.sleep(30)
           PY
           setsid nohup python3 -u /tmp/telemetry.py > /tmp/telemetry.log 2>&1 &
-          sleep 4
-          cat /tmp/telemetry.log || true
+          sleep 3
+          head -3 /tmp/telemetry.log 2>/dev/null || true
 
-      - name: Start disk watchdog
-        run: |
+          # A runner with a full disk cannot upload its log, so it just
+          # vanishes. Killing the build while there is room turns that into an
+          # ordinary failure with a log.
           cat > /tmp/diskwatch.sh <<'SH'
           #!/bin/bash
           while true; do
             avail=$(df --output=avail -m / | tail -1 | tr -d ' ')
             if [ "${avail}" -lt 2048 ]; then
               echo "::error::disk nearly full (${avail} MB free) - aborting before the runner dies"
+              touch /tmp/diskfull
               df -h /
-              du -sh "${WORKDIR}" 2>/dev/null | tail -1
               du -sh "${WORKDIR}/out" 2>/dev/null | tail -1
               du -sh "${WORKDIR}"/out/* 2>/dev/null | sort -h | tail -10
               pkill -f soong_ui || true
@@ -444,54 +507,8 @@ jobs:
           SH
           chmod +x /tmp/diskwatch.sh
           setsid nohup /tmp/diskwatch.sh > /tmp/diskwatch.log 2>&1 &
-          echo "watchdog armed at $(df -h / | tail -1 | awk '{print $4}') free"
+          echo "watchdog armed: $(df -h / | tail -1 | awk '{print $4}') free"
 
-      # ---------------------------------------------------------------------
-      # Build
-      # ---------------------------------------------------------------------
-      # GOGC/GOMEMLIMIT/GOMAXPROCS keep Soong's Go heap inside the runner's
-      # RAM. Measured on this exact runner class (16 GB) by ILYESwsa's F11
-      # workflow: soong_build was OOM-killed at ~13.6 GB RSS.
-      #
-      # 11 GiB was the old value and it does keep soong_build alive, but three
-      # consecutive builds then died about 37 minutes into this step with
-      # "the hosted runner lost communication with the server" and no log at
-      # all (the blob never gets uploaded when the runner dies, so the failure
-      # is only visible as an annotation). That signature is resource
-      # starvation of the runner agent, and a 11 GiB soft target on a 15 GiB
-      # machine leaves the four parallel compilers nothing but swap: the VM
-      # thrashes, Runner.Listener stops answering, and GitHub reports the job
-      # dead ten minutes later than it actually died.
-      #
-      # 6 GiB gives soong_build plenty (this tree needs 2-4 GiB) and leaves the
-      # rest for clang. -j3 on mka does the same for the compilers, which is
-      # the other half of the peak. This did NOT stop the deaths, so memory is
-      # not the cause; it is kept because it is cheap and it is not wrong.
-      - name: Build
-        env:
-          GOGC: "40"
-          GOMEMLIMIT: "6GiB"
-          GOMAXPROCS: "2"
-          ALLOW_MISSING_DEPENDENCIES: "true"
-        run: |
-          cd "${WORKDIR}"
-
-          # Compiler cache. Soong only uses ccache when USE_CCACHE and
-          # CCACHE_EXEC are both set in the build's own environment, and -z
-          # zeroes the counters so the stats at the end of this step describe
-          # this run instead of the history of the restored cache.
-          if command -v ccache >/dev/null 2>&1; then
-            export USE_CCACHE=1
-            export CCACHE_EXEC="$(command -v ccache)"
-            mkdir -p "${CCACHE_DIR}"
-            ccache -M "${CCACHE_MAXSIZE}" >/dev/null 2>&1 || true
-            ccache -z >/dev/null 2>&1 || true
-            echo "ccache: ${CCACHE_EXEC} max ${CCACHE_MAXSIZE} dir ${CCACHE_DIR}"
-            du -sh "${CCACHE_DIR}" 2>/dev/null || true
-          else
-            echo "::warning::ccache is not installed; building without a compiler cache"
-            unset USE_CCACHE CCACHE_EXEC
-          fi
 
           # The wiki is explicit: AERA_BUILD_DEVICE must be set in the calling
           # shell *before* envsetup is sourced, otherwise another tree's exports
@@ -541,66 +558,105 @@ jobs:
           cp -f "${SHIM}" "${DEVICE_PATH}/recovery/root/sbin/"
           ls -l "${DEVICE_PATH}/recovery/root/sbin/libaera_boot_trim.so"
 
-          # gralloc1 shim: the gralloc1 API implemented over the plain
-          # mali_gralloc entry points MediaTek's allocator@4.0 impl exports.
-          # selene has no gralloc1 module, and the fbdev gralloc0 module is not
-          # a substitute. This one is not part of the ramdisk -- the backend
-          # loads it from the staged blob store through ro.aera.gpu.gralloc --
-          # so build it explicitly and check the two properties that make it
-          # loadable inside the Mali namespace.
-          m libaera_gralloc1
-          GRALLOC=$(find out/soong/.intermediates "out/target/product/${DEVICE}" \
-            -name libaera_gralloc1.so -print -quit 2>/dev/null)
-          if [ -z "${GRALLOC}" ]; then
-            echo "::error::libaera_gralloc1.so was not produced by 'm libaera_gralloc1'"
-            exit 1
-          fi
-          echo "gralloc shim built: ${GRALLOC}"
-          if ! readelf -hW "${GRALLOC}" | grep -q 'AArch64'; then
-            echo "::error::libaera_gralloc1.so is not an AArch64 object"
-            readelf -hW "${GRALLOC}" || true
-            exit 1
-          fi
-          # dlsym(HAL_MODULE_INFO_SYM_AS_STR) is how mali_display.cpp finds the
-          # module, so a hidden symbol would make the HAL invisible. Note the
-          # name: hardware.h defines HAL_MODULE_INFO_SYM as HMI, and
-          # HAL_MODULE_INFO_SYM_AS_STR as "HMI" -- grepping for the macro name
-          # matches nothing at all.
-          if ! readelf --dyn-syms -W "${GRALLOC}" | grep -qE 'OBJECT +GLOBAL +DEFAULT +[0-9]+ HMI$'; then
-            echo "::error::libaera_gralloc1.so does not export HMI (HAL_MODULE_INFO_SYM)"
-            readelf --dyn-syms -W "${GRALLOC}" || true
-            exit 1
-          fi
-          echo "exported: $(readelf --dyn-syms -W "${GRALLOC}" | grep -E 'OBJECT +GLOBAL +DEFAULT +[0-9]+ HMI$')"
-          # The private namespace is linked to the recovery process for exactly
-          # libc/libm/libdl. Any other DT_NEEDED would have to be staged into
-          # the blob store as well, so fail loudly instead of shipping a shim
-          # that cannot resolve.
-          if readelf -dW "${GRALLOC}" | grep NEEDED | grep -Ev 'libc\.so|libm\.so|libdl\.so'; then
-            echo "::error::libaera_gralloc1.so depends on a library the Mali namespace does not share"
-            exit 1
-          fi
-          mkdir -p "${GITHUB_WORKSPACE}/artifacts"
-          cp -f "${GRALLOC}" "${GITHUB_WORKSPACE}/artifacts/gralloc.mt6768.so"
-          ls -l "${GITHUB_WORKSPACE}/artifacts/gralloc.mt6768.so"
-
+          # The gralloc1 shim is in PRODUCT_PACKAGES, so `mka` builds it as
+          # part of the image; a separate `m libaera_gralloc1` here would cost a
+          # second full soong analysis (a ~9 GB, several-minute step) for a
+          # module the build already produces. Its assertions moved to after
+          # the build, where the artefact actually exists.
           set +e
-          # -j3, not the runner's four cores: see the note above the step. The
-          # cap is about peak memory, and the runner dying costs the whole
-          # build whereas the extra parallelism only saves minutes.
-          mka adbd "${BUILD_TARGET}" -j3
+          # The runner dies ~47 minutes into this step, five times out of five,
+          # and it takes its log and its ccache with it. Ending the step before
+          # that point is the only way to finish the job normally -- and a job
+          # that finishes normally is the only kind that uploads a log and
+          # saves a cache. Soong is invoked directly because `mka` is a shell
+          # function and `timeout` cannot exec a function.
+          #
+          # 1500 s of compilation plus ~9 minutes of soong analysis (two
+          # invocations: libaera_boot_trim, then this one) keeps the whole step
+          # near 34 minutes, which leaves real margin under the wall.
+          BUILD_BUDGET_SEC="${BUILD_BUDGET_SEC:-1500}"
+          echo "build budget: ${BUILD_BUDGET_SEC}s"
+          # One deadline for the whole step, not one per attempt: the retry
+          # below must not be handed a fresh 1500 s, or two attempts would add
+          # up to ~59 minutes and walk straight into the wall the budget exists
+          # to stay under.
+          DEADLINE=$(( $(date +%s) + BUILD_BUDGET_SEC ))
+          build_within_budget() {
+            local remain=$(( DEADLINE - $(date +%s) ))
+            if [ "${remain}" -lt 60 ]; then remain=60; fi
+            echo "--- building (${remain}s of budget left): $*"
+            timeout --signal=INT --kill-after=120 "${remain}" \
+              build/soong/soong_ui.bash --make-mode "$@"
+          }
+          build_within_budget adbd "${BUILD_TARGET}" -j3
           rc=$?
-
-          # selene is recovery-as-boot, so bootimage is the normal target.
-          # If the boot rule is unavailable on this tree, recoveryimage still
-          # produces a flashable image.
-          if [ "$rc" -ne 0 ] || ! ls out/target/product/${DEVICE}/*.img >/dev/null 2>&1; then
-            echo "--- ${BUILD_TARGET} failed (rc=$rc), retrying with recoveryimage"
-            mka adbd recoveryimage -j3
-            rc=$?
+          if [ "$rc" -eq 124 ] || [ "$rc" -eq 130 ]; then
+            echo "::warning::stopped by the ${BUILD_BUDGET_SEC}s budget, not by an error"
+            echo "::warning::this run banks its ccache and uploads its log; the next one resumes further along"
+          elif [ "$rc" -ne 0 ]; then
+            if [ -e /tmp/diskfull ]; then
+              # The watchdog already killed this build on purpose. Retrying
+              # would either die the same way or spend the budget compiling
+              # into a full disk.
+              echo "::error::aborted by the disk watchdog; not retrying"
+            elif ! ls out/target/product/${DEVICE}/*.img >/dev/null 2>&1; then
+              # selene is recovery-as-boot, so bootimage is the normal target.
+              # If the boot rule is unavailable on this tree, recoveryimage
+              # still produces a flashable image.
+              echo "--- ${BUILD_TARGET} failed (rc=$rc), retrying with recoveryimage"
+              build_within_budget adbd recoveryimage -j3
+              rc=$?
+            fi
           fi
 
           echo "BUILD_RC=$rc"
+
+          # The gralloc1 shim assertions, moved here because the module is now
+          # produced by mka rather than by a separate `m` invocation.
+          #
+          # Only when the build actually finished. A budget stop is a normal
+          # outcome of this workflow (see above) and the shim is one module
+          # among thousands, so it will not exist yet; treating that as "the
+          # shim was not produced" would turn an intentional stop into a
+          # misleading hard failure.
+          if [ "$rc" -eq 0 ]; then
+            GRALLOC=$(find out/soong/.intermediates "out/target/product/${DEVICE}" \
+              -name libaera_gralloc1.so -print -quit 2>/dev/null)
+            if [ -z "${GRALLOC}" ]; then
+              echo "::error::libaera_gralloc1.so was not produced, but device.mk puts it in PRODUCT_PACKAGES"
+              exit 1
+            fi
+            echo "gralloc shim built: ${GRALLOC}"
+            if ! readelf -hW "${GRALLOC}" | grep -q 'AArch64'; then
+              echo "::error::libaera_gralloc1.so is not an AArch64 object"
+              readelf -hW "${GRALLOC}" || true
+              exit 1
+            fi
+            # dlsym(HAL_MODULE_INFO_SYM_AS_STR) is how mali_display.cpp finds
+            # the module, so a hidden symbol would make the HAL invisible. Note
+            # the name: hardware.h defines HAL_MODULE_INFO_SYM as HMI, and
+            # HAL_MODULE_INFO_SYM_AS_STR as "HMI" -- grepping for the macro
+            # name matches nothing at all.
+            if ! readelf --dyn-syms -W "${GRALLOC}" | grep -qE 'OBJECT +GLOBAL +DEFAULT +[0-9]+ HMI$'; then
+              echo "::error::libaera_gralloc1.so does not export HMI (HAL_MODULE_INFO_SYM)"
+              readelf --dyn-syms -W "${GRALLOC}" || true
+              exit 1
+            fi
+            # The private namespace is linked to the recovery process for
+            # exactly libc/libm/libdl. Any other DT_NEEDED would have to be
+            # staged into the blob store as well, so fail loudly instead of
+            # shipping a shim that cannot resolve.
+            if readelf -dW "${GRALLOC}" | grep NEEDED | grep -Ev 'libc\.so|libm\.so|libdl\.so'; then
+              echo "::error::libaera_gralloc1.so depends on a library the Mali namespace does not share"
+              exit 1
+            fi
+            mkdir -p "${GITHUB_WORKSPACE}/artifacts"
+            cp -f "${GRALLOC}" "${GITHUB_WORKSPACE}/artifacts/gralloc.mt6768.so"
+            ls -l "${GITHUB_WORKSPACE}/artifacts/gralloc.mt6768.so"
+          else
+            echo "::notice::build did not finish (rc=${rc}); skipping the gralloc1 shim assertions"
+          fi
+
 
           # A green build that silently omits the shim would send a still-broken
           # image to the phone, so verify the staged recovery root -- that is
