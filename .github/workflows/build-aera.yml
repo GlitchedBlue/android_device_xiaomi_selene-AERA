@@ -239,12 +239,19 @@ jobs:
       #
       # swappiness 100 is the recommended value for zram: with a fast compressed
       # device, evicting anonymous pages is cheaper than dropping page cache.
+      #
+      # This step used to warn and `exit 0` on every failure, and that is how
+      # run 43948741249 lost its runner: its telemetry reported SwapTotal
+      # 33791 MB -- the 30 GB file plus the image's own 3 GB, i.e. **no zram at
+      # all** -- while this step was green. Soong's analysis then ran with half
+      # the swap it was tuned for, and 45 minutes into Build the box stopped
+      # answering. Never let the swap layout be a guess again.
       - name: Add compressed RAM swap
         run: |
-          set -u
+          set -euo pipefail
           if ! sudo modprobe zram num_devices=1 2>/dev/null; then
-            echo "::warning::zram module unavailable; staying on disk swap only"
-            exit 0
+            echo "::error::modprobe zram failed - no compressed swap on this image"
+            exit 1
           fi
           for alg in lz4 zstd; do
             if echo "${alg}" | sudo tee /sys/block/zram0/comp_algorithm >/dev/null 2>&1; then
@@ -253,20 +260,30 @@ jobs:
             fi
           done
           if ! echo 24G | sudo tee /sys/block/zram0/disksize >/dev/null; then
-            echo "::warning::could not size zram0; staying on disk swap only"
-            exit 0
+            echo "::error::could not size zram0 (already in use?)"
+            exit 1
           fi
           sudo mkswap /dev/zram0 >/dev/null
           sudo swapon --priority 100 /dev/zram0
           sudo sysctl -w vm.swappiness=100 >/dev/null
           echo "--- swap devices (zram first) ---"
           swapon --show
+          total=$(awk '/^SwapTotal:/ {print int($2/1024)}' /proc/meminfo)
+          echo "SwapTotal: ${total} MB"
+          if [ "${total}" -lt 50000 ]; then
+            echo "::error::SwapTotal is ${total} MB, expected >= 50000 (30 GB file + 24 GB zram). zram is not active; refusing to start a 2 hour build that will thrash."
+            swapon --show
+            exit 1
+          fi
 
       - name: Show resources
         run: |
           echo "cores: $(nproc)"
           df -h /
           free -h
+          # The swap layout is the single most important line in this log: the
+          # build only survives on ~54 GB of it, 24 of which must be zram.
+          swapon --show
 
       # ---------------------------------------------------------------------
       # Toolchain
@@ -754,11 +771,23 @@ jobs:
           sleep 3
           head -3 /tmp/telemetry.log 2>/dev/null || true
 
-          # A runner with a full disk cannot upload its log, so it just
-          # vanishes. Killing the build while there is room turns that into an
-          # ordinary failure with a log.
-          cat > /tmp/diskwatch.sh <<'SH'
+          # Two ways this runner dies without leaving a log, both converted here
+          # into an ordinary failure while the machine can still answer:
+          #
+          #   1. disk full -> the log cannot be uploaded, the runner vanishes.
+          #   2. memory thrash -> the box stops answering entirely. Run
+          #      43948741249 was last heard from at t+124s of Build (soong_build
+          #      12.2 GB, PSI 6.21 and climbing) and was reported dead 45
+          #      minutes later with no log at all. PSI is the kernel's own
+          #      measure of how much time is lost to stalls, so a sustained high
+          #      value is the box already failing, not a prediction.
+          #
+          # The PSI thresholds are deliberately far above anything a surviving
+          # build has produced (run 43936328986 finished a full image at
+          # avg10=43), so this aborts only the state that kills the runner.
+          cat > /tmp/watchdog.sh <<'SH'
           #!/bin/bash
+          stall=0
           while true; do
             avail=$(df --output=avail -m / | tail -1 | tr -d ' ')
             if [ "${avail}" -lt 2048 ]; then
@@ -771,12 +800,29 @@ jobs:
               pkill -f ninja || true
               exit 1
             fi
+            avail_mb=$(awk '/^MemAvailable:/ {print int($2/1024)}' /proc/meminfo)
+            psi=$(awk '/^some/ {sub("avg10=","",$2); print int($2)}' /proc/pressure/memory)
+            if [ "${avail_mb}" -lt 250 ] && [ "${psi}" -ge 70 ]; then
+              stall=$((stall + 1))
+            else
+              stall=0
+            fi
+            if [ "${stall}" -ge 6 ]; then
+              echo "::error::memory thrash for ${stall}0s (avail ${avail_mb} MB, PSI avg10 ${psi}%) - aborting before the runner stops answering"
+              touch /tmp/thrash
+              free -h
+              swapon --show
+              ps -eo rss,comm --sort=-rss | head -5
+              pkill -f soong_ui || true
+              pkill -f ninja || true
+              exit 1
+            fi
             sleep 10
           done
           SH
-          chmod +x /tmp/diskwatch.sh
-          setsid nohup /tmp/diskwatch.sh > /tmp/diskwatch.log 2>&1 &
-          echo "watchdog armed: $(df -h / | tail -1 | awk '{print $4}') free"
+          chmod +x /tmp/watchdog.sh
+          setsid nohup /tmp/watchdog.sh > /tmp/watchdog.log 2>&1 &
+          echo "watchdog armed: $(df -h / | tail -1 | awk '{print $4}') free, swap $(awk '/^SwapTotal:/ {print int($2/1024)}' /proc/meminfo) MB"
 
 
           # The wiki is explicit: AERA_BUILD_DEVICE must be set in the calling
@@ -866,6 +912,12 @@ jobs:
               # would either die the same way or spend the budget compiling
               # into a full disk.
               echo "::error::aborted by the disk watchdog; not retrying"
+            elif [ -e /tmp/thrash ]; then
+              # Same reasoning: the box was 70%+ stalled for a minute, which is
+              # the state that loses the runner. Retrying inside the same job
+              # would hit the same wall with less swap than it started with.
+              echo "::error::aborted by the memory watchdog after sustained PSI stall; not retrying"
+              cat /tmp/watchdog.log 2>/dev/null || true
             elif ! ls out/target/product/${DEVICE}/*.img >/dev/null 2>&1; then
               # selene is recovery-as-boot, so bootimage is the normal target.
               # If the boot rule is unavailable on this tree, recoveryimage
