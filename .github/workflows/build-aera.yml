@@ -915,10 +915,21 @@ jobs:
               done
             fi
 
-            GRALLOC=$(find out/soong/.intermediates "out/target/product/${DEVICE}" \
-              -name libaera_gralloc1.so -print -quit 2>/dev/null)
+            # Soong builds this module for both ABIs unless the .bp pins one.
+            # Run 43936328986 found the 32-bit android_arm_armv8-2a variant
+            # first, which is why it failed here; recovery is AArch64, so pick
+            # the 64-bit object instead of whichever `find` happens to return.
+            mapfile -t GRALLOC_ALL < <(find out/soong/.intermediates \
+              "out/target/product/${DEVICE}" -name libaera_gralloc1.so 2>/dev/null)
+            GRALLOC=""
+            for candidate in "${GRALLOC_ALL[@]}"; do
+              if readelf -hW "${candidate}" 2>/dev/null | grep -q 'AArch64'; then
+                GRALLOC="${candidate}"
+                break
+              fi
+            done
             if [ -z "${GRALLOC}" ]; then
-              echo "::error::libaera_gralloc1.so was not produced. It is in PRODUCT_PACKAGES, which only feeds the system/vendor images, so 'bootimage' has to name it on the make command line."
+              echo "::error::no AArch64 libaera_gralloc1.so was produced (found: ${GRALLOC_ALL[*]:-nothing}). It is in PRODUCT_PACKAGES, which only feeds the system/vendor images, so 'bootimage' has to name it on the make command line."
               FAIL=1
             else
               echo "gralloc shim built: ${GRALLOC}"

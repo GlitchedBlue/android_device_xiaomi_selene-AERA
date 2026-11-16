@@ -18,6 +18,12 @@ cc_library_shared {
     name: "libaera_gralloc1",
     srcs: ["gralloc1_shim.cpp"],
 
+    // Recovery is 64-bit: /system/bin/recovery is AArch64 and the shim is
+    // dlopen()ed into that process. Without this Soong builds both ABIs, and
+    // run 43936328986 found the 32-bit one first and correctly failed its
+    // "must be AArch64" assertion -- a 32-bit shim can never be loaded there.
+    compile_multilib: "64",
+
     // HAL_MODULE_INFO_SYM and the gralloc1 entry points must be exported.
     cflags: [
         "-Wall",
