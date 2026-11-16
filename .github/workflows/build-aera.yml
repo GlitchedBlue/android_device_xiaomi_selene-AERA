@@ -99,13 +99,19 @@ jobs:
       # slimhub frees the preinstalled toolchains, which is where the ~110 GB of
       # free space at the start comes from. The swap file is carved out of that
       # same disk, so its size is not free: a 30 GB file plus the ~35 GB source
-      # tree plus a full out/ is what the build has to fit in. Four builds died
-      # at a fixed point with the runner vanishing and no log, so the file is
-      # down to 8 GB -- enough to cover a spike, but 22 GB returned to out/.
+      # tree plus a full out/ is what the build has to fit in.
+      #
+      # It is back to 30 GB because that is the only configuration that has ever
+      # produced a green image on this runner (run #7). The 8 GB experiment was
+      # a guess that the vanishing runner was a full disk; there is no evidence
+      # for that, and it made the soong analysis peak worse: run 43835500987 was
+      # killed at 14.9 GB RSS with swap 5.7/8 GB used, five minutes into Build.
+      # Disk is now sampled every 30 s, so the disk theory can be settled with
+      # data instead of by starving the memory peak.
       - name: Set swap space
         uses: pierotofy/set-swap-space@master
         with:
-          swap-size-gb: 8
+          swap-size-gb: 30
 
       - name: Show resources
         run: |
@@ -339,24 +345,18 @@ jobs:
       # RAM. Measured on this exact runner class (16 GB) by ILYESwsa's F11
       # workflow: soong_build was OOM-killed at ~13.6 GB RSS.
       #
-      # 11 GiB was the old value and it does keep soong_build alive, but three
-      # consecutive builds then died about 37 minutes into this step with
-      # "the hosted runner lost communication with the server" and no log at
-      # all (the blob never gets uploaded when the runner dies, so the failure
-      # is only visible as an annotation). That signature is resource
-      # starvation of the runner agent, and a 11 GiB soft target on a 15 GiB
-      # machine leaves the four parallel compilers nothing but swap: the VM
-      # thrashes, Runner.Listener stops answering, and GitHub reports the job
-      # dead ten minutes later than it actually died.
+      # 11 GiB plus 30 GB of swap is the combination that has actually produced
+      # a green image here (run #7), so it is what this uses. It is a soft
+      # limit and the analysis genuinely needs ~14 GB, so the limit is not what
+      # keeps it alive -- the swap is.
       #
-      # 6 GiB gives soong_build plenty (this tree needs 2-4 GiB) and leaves the
-      # rest for clang. -j3 on mka does the same for the compilers, which is
-      # the other half of the peak. This did NOT stop the deaths, so memory is
-      # not the cause; it is kept because it is cheap and it is not wrong.
+      # 6 GiB was tried and is not what failed (the deaths did not move), but it
+      # only makes the GC burn CPU it cannot save: at 14 GB live there is
+      # nothing to collect. Do not lower it again expecting a memory win.
       - name: Build
         env:
           GOGC: "40"
-          GOMEMLIMIT: "6GiB"
+          GOMEMLIMIT: "11GiB"
           GOMAXPROCS: "2"
           ALLOW_MISSING_DEPENDENCIES: "true"
           # Raise this once the wall is understood; 1500 s is chosen to end the
@@ -429,14 +429,30 @@ jobs:
                   return json.loads(r.read().decode() or "{}")
 
 
-          def sh(cmd):
+          def sh(cmd, limit=20):
+              # `timeout` goes INSIDE the command. subprocess.run's own timeout
+              # kills only bash; a grandchild holding the pipe then makes the
+              # follow-up communicate() block forever, which is how the previous
+              # sampler went silent at t+155s while the job lived on.
               try:
                   p = subprocess.run(
-                      ["bash", "-lc", cmd], capture_output=True, text=True, timeout=25
+                      ["bash", "-lc", "timeout %d %s" % (limit, cmd)],
+                      capture_output=True,
+                      text=True,
+                      timeout=limit + 10,
                   )
                   return (p.stdout or p.stderr).strip().replace("\n", " ")
               except Exception as e:
-                  return "err:%s" % e
+                  return "err:%s" % type(e).__name__
+
+
+          def meminfo():
+              d = {}
+              with open("/proc/meminfo") as fh:
+                  for line in fh:
+                      k, v = line.split(":", 1)
+                      d[k] = int(v.split()[0]) // 1024
+              return d
 
 
           lines = []
@@ -445,35 +461,44 @@ jobs:
           out = "?"
           while True:
               el = int(time.time() - t0)
-              disk = sh("df -h / | tail -1 | awk '{print $3\" used, \"$4\" avail, \"$5}'")
-              mem = sh("free -m | awk '/^Mem:/{print $3\"/\"$2\" MB\"}'")
-              swp = sh("free -m | awk '/^Swap:/{print $3\"/\"$2\" MB\"}'")
-              load = sh("cut -d' ' -f1-3 /proc/loadavg")
-              # PSI: "some avg10" is the share of time something stalled on
-              # memory. That separates "using a lot" from "thrashing".
-              psi = sh(
-                  "awk '/^some/{printf \"%s %s\", $2, $5}' /proc/pressure/memory "
-                  "2>/dev/null"
+              # /proc reads: no subprocess, so they still work while the box is
+              # thrashing. MemAvailable is the number that actually predicts the
+              # OOM killer, and it is not in `free` output.
+              m = meminfo()
+              mem = "used %d/%d MB avail %d" % (
+                  m["MemTotal"] - m["MemAvailable"],
+                  m["MemTotal"],
+                  m["MemAvailable"],
               )
-              procs = sh("ps -e --no-headers | wc -l")
-              fds = sh("cut -d' ' -f1 /proc/sys/fs/file-nr")
+              swp = "%d/%d MB" % (m["SwapTotal"] - m["SwapFree"], m["SwapTotal"])
+              load = " ".join(open("/proc/loadavg").read().split()[:3])
+              try:
+                  p = open("/proc/pressure/memory").readline().split()
+                  psi = "avg10=%s total=%s" % (
+                      p[1].split("=")[1],
+                      p[4].split("=")[1],
+                  )
+              except Exception:
+                  psi = "?"
+              disk = sh("df -h / | tail -1 | awk '{print $3\" used, \"$4\" avail, \"$5}'")
+              if n % 2 == 0:
+                  out = sh("du -sm '%s/out' 2>/dev/null | cut -f1" % WORKDIR) or "?"
+              nclang = sh("pgrep -c clang 2>/dev/null || echo 0")
               top = sh(
                   "ps -eo rss,comm --sort=-rss | sed -n '2,4p' "
                   "| awk '{printf \"%s=%dM \", $2, $1/1024}'"
               )
-              if n % 10 == 0:
-                  out = sh("du -sh '%s/out' 2>/dev/null | cut -f1" % WORKDIR) or "?"
               lines.append(
-                  "t+%5ds | disk %s | out %s | mem %s | swap %s | load %s "
-                  "| psi %s | procs %s | fds %s | %s"
-                  % (el, disk, out, mem, swp, load, psi, procs, fds, top)
+                  "t+%5ds | disk %s | out %sM | mem %s | swap %s | load %s "
+                  "| psi %s | clang %s | %s"
+                  % (el, disk, out, mem, swp, load, psi, nclang, top)
               )
-              # dmesg is the only thing that says outright whether the kernel
-              # OOM-killed something, and which process it picked.
               if n % 5 == 0:
+                  # dmesg is the only source that says outright whether the
+                  # kernel OOM-killed something, and which process it chose.
                   klog = sh(
-                      "sudo -n dmesg -T 2>/dev/null | tail -4 "
-                      "| tr '\\n' '|' | cut -c1-400"
+                      "sudo -n dmesg -T | tail -6 | tr '\\n' '|' | cut -c1-500",
+                      12,
                   )
                   if klog:
                       lines.append("    klog: " + klog)
@@ -595,7 +620,7 @@ jobs:
             timeout --signal=INT --kill-after=120 "${remain}" \
               build/soong/soong_ui.bash --make-mode "$@"
           }
-          build_within_budget adbd "${BUILD_TARGET}" -j3
+          build_within_budget adbd "${BUILD_TARGET}"
           rc=$?
           if [ "$rc" -eq 124 ] || [ "$rc" -eq 130 ]; then
             touch /tmp/budget_stop
@@ -612,7 +637,7 @@ jobs:
               # If the boot rule is unavailable on this tree, recoveryimage
               # still produces a flashable image.
               echo "--- ${BUILD_TARGET} failed (rc=$rc), retrying with recoveryimage"
-              build_within_budget adbd recoveryimage -j3
+              build_within_budget adbd recoveryimage
               rc=$?
             fi
           fi
