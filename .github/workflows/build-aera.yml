@@ -770,14 +770,19 @@ jobs:
           fi
           exit "$rc"
 
-      # Saved even when the build fails, and even when an older cache was
-      # restored. The old condition skipped the save whenever the restore hit,
-      # which meant the cache could only ever hold whatever the very first
-      # successful save contained -- every later run restored it, compiled with
-      # it, and then threw its own results away. The key carries the run id, so
-      # each save is a new entry and the restore-key prefix picks the newest.
+      # Saved only when nothing was restored. That looks backwards, and it is,
+      # but it is deliberate: GitHub allows 10 GB of cache per repository and
+      # the *source* cache is 17.9 GB on its own. It survives only while
+      # nothing else is written, and the moment a ccache entry is saved GitHub
+      # evicts it as the least-recently-used oversized entry. That is exactly
+      # what happened at 11:38 -- run 43851152934 saved its ccache and the
+      # source cache vanished, so run 43860102276 had to repo sync from zero.
+      #
+      # Between "13 minutes of repo sync on every run" and "a ccache that is
+      # cold on every run that matters", the source cache is the better deal
+      # for now. If the source cache is ever dropped, flip this to always().
       - name: Save compiler cache
-        if: always()
+        if: always() && steps.ccache_restore.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
         with:
           path: ${{ env.CCACHE_DIR }}
