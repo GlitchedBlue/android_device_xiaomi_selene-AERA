@@ -63,7 +63,12 @@ on:
     - cron: '*/30 * * * *'
 
 concurrency:
-  group: aera-selene
+  # v2 because run 43936328986 (commit b6d4bff2, the pre-fix patch step) stopped
+  # responding to cancellation and held the old group for over an hour, which
+  # queued every fixed build behind a job that could only produce an unpatched
+  # image anyway. A new group lets the fixed run start immediately; the old one
+  # is left to time out on its own.
+  group: aera-selene-v2
   cancel-in-progress: false
 
 permissions:
