@@ -1,0 +1,120 @@
+name: Patch check (fast)
+
+# Why this exists
+# --------------
+# Run 43899667091 produced a green image whose recovery binary does not contain
+# a single line of patches/bootable/recovery/*.patch. Proven on the device, not
+# guessed: the mini debug info embedded in /system/bin/recovery (the
+# .gnu_debugdata section) exports
+#
+#   _ZN6aeraui11MaliDisplay4Impl7HotplugEPvmi     <- pristine
+#
+# but neither Impl::Vsync (patch 0002) nor MaliDisplay::DescribeBuffer
+# (patch 0003), and the binary contains none of the patches' log strings
+# ("vsync/refresh registration", "dma-buf import %u failed"). Its .text is also
+# byte-identical to the image built the day before the patches existed.
+#
+# The image build's "Apply local patches" step nevertheless reported success,
+# because it can succeed while applying nothing: the loop is silent when the
+# glob matches no files, and it never checks that the change is still there when
+# the build starts.
+#
+# This workflow reproduces that step on its own, against a shallow clone of the
+# same upstream branch, in about a minute instead of ninety. It is the only
+# cheap way to tell "the patch step is broken" apart from "the build ignores the
+# patched tree".
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - aera-16.0
+    paths:
+      - 'patches/**'
+      - '.github/workflows/patch-check.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  apply:
+    name: Apply patches/bootable/recovery to apkreader mali-testing
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Clone the same upstream branch the image build switches to
+        run: |
+          set -euo pipefail
+          git clone --depth=1 -b mali-testing \
+            https://github.com/apkreader/android_bootable_recovery.git bootable/recovery
+          echo "upstream: $(git -C bootable/recovery rev-parse --short HEAD)"
+
+      - name: Apply the patches exactly as the image build does
+        run: |
+          set -euo pipefail
+          root="${GITHUB_WORKSPACE}/patches"
+          shopt -s globstar nullglob
+          files=("$root"/**/*.patch)
+          echo "patch files found: ${#files[@]}"
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "::error::the glob matched no patches -- this is the silent no-op that shipped an unpatched image"
+            exit 1
+          fi
+          count=0
+          for patch in "${files[@]}"; do
+            project="${patch#"$root"/}"
+            project="${project%/*}"
+            echo "applying $(basename "$patch") to ${project}"
+            if ! git -C "${project}" apply --check "${patch}"; then
+              echo "::error::$(basename "$patch") does not apply to ${project} (upstream context changed)"
+              exit 1
+            fi
+            git -C "${project}" apply "${patch}"
+            count=$((count + 1))
+          done
+          echo "patches applied: ${count}"
+          if [ "${count}" -ne "${#files[@]}" ]; then
+            echo "::error::applied ${count} of ${#files[@]} patches"
+            exit 1
+          fi
+          git -C bootable/recovery --no-pager diff --stat
+          git -C bootable/recovery --no-pager status --short
+
+      - name: The patched source must contain every marker
+        run: |
+          set -euo pipefail
+          fail=0
+          check() {
+            if grep -q -- "$1" "$2"; then
+              echo "ok    $2 : $1"
+            else
+              echo "::error::missing in $2 : $1"
+              fail=1
+            fi
+          }
+          absent() {
+            if grep -q -- "$1" "$2"; then
+              echo "::error::still present in $2 : $1"
+              fail=1
+            else
+              echo "ok    $2 : no '$1'"
+            fi
+          }
+          # 0001: the composer is never dlclose()d, so the line must be gone.
+          absent 'if (composer_library) dlclose(composer_library);' \
+                 bootable/recovery/aeraui/core/mali_display.cpp
+          # 0002: vsync+refresh are registered before hotplug.
+          check 'vsync/refresh registration' \
+                bootable/recovery/aeraui/core/mali_display.cpp
+          # 0003: dma-buf import, in both the renderer and the display.
+          check 'dma-buf import %u failed' \
+                bootable/recovery/aeraui/core/gpu_renderer.cpp
+          check 'DescribeBuffer' \
+                bootable/recovery/aeraui/core/mali_display.cpp
+          if [ "$fail" -ne 0 ]; then
+            echo "::error::the patches applied but the markers are not in the tree"
+            exit 1
+          fi
+          echo "all markers present"
