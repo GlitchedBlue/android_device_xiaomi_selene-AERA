@@ -32,6 +32,10 @@ on:
         description: 'Device tree branch'
         required: false
         default: aera-16.0
+      chain:
+        description: 'Generation of the auto-chain (0 = start a fresh chain)'
+        required: false
+        default: '0'
   push:
     branches:
       - aera-16.0
@@ -53,6 +57,9 @@ concurrency:
 
 permissions:
   contents: write
+  # Re-dispatching this workflow is the exception to "events created by
+  # GITHUB_TOKEN do not start runs": workflow_dispatch is explicitly allowed.
+  actions: write
 
 jobs:
   build:
@@ -591,6 +598,7 @@ jobs:
           build_within_budget adbd "${BUILD_TARGET}" -j3
           rc=$?
           if [ "$rc" -eq 124 ] || [ "$rc" -eq 130 ]; then
+            touch /tmp/budget_stop
             echo "::warning::stopped by the ${BUILD_BUDGET_SEC}s budget, not by an error"
             echo "::warning::this run banks its ccache and uploads its log; the next one resumes further along"
           elif [ "$rc" -ne 0 ]; then
@@ -743,6 +751,41 @@ jobs:
         with:
           path: ${{ env.CCACHE_DIR }}
           key: aera-ccache-${{ env.MANIFEST_BRANCH }}-${{ github.run_id }}
+
+      # Budget stops are the normal way this workflow makes progress: each run
+      # banks its compiler cache and the next one resumes further along. Doing
+      # that by hand needs a laptop on the network, so the run queues its own
+      # successor. workflow_dispatch is the one event GITHUB_TOKEN is allowed to
+      # trigger, which is why this is a dispatch and not a push.
+      - name: Queue the next build
+        if: always()
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CHAIN: ${{ github.event.inputs.chain || '0' }}
+        run: |
+          if [ ! -e /tmp/budget_stop ]; then
+            echo "not a budget stop; not queueing a successor"
+            exit 0
+          fi
+          if [ "${CHAIN:-0}" -ge 8 ]; then
+            echo "::warning::chain reached generation ${CHAIN}; stopping so it cannot run forever"
+            exit 0
+          fi
+          next=$(( ${CHAIN:-0} + 1 ))
+          echo "queueing generation ${next} on ${GITHUB_REF_NAME}"
+          code=$(curl -sS -o /tmp/dispatch.out -w '%{http_code}' \
+            -X POST \
+            -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/workflows/build-aera.yml/dispatches" \
+            -d "{\"ref\":\"${GITHUB_REF_NAME}\",\"inputs\":{\"chain\":\"${next}\",\"target\":\"${BUILD_TARGET}\",\"device_branch\":\"${DEVICE_BRANCH}\"}}")
+          echo "dispatch HTTP ${code}"
+          cat /tmp/dispatch.out 2>/dev/null || true
+          if [ "${code}" != "204" ]; then
+            echo "::error::could not queue the next build (HTTP ${code})"
+            exit 1
+          fi
 
       - name: Stop resource telemetry
         if: always()
