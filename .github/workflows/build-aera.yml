@@ -397,10 +397,24 @@ jobs:
           fi
           echo "sync complete: $(du -sh . | cut -f1)"
 
-      # Save before Drop .repo deletes the thing being cached. continue-on-error
-      # so a cache failure can never fail a build that is otherwise fine.
+      # Disabled on purpose: GitHub allows 10 GB of cache per repository and this
+      # entry is 18.8 GB, so writing it evicts the compiler cache and writing
+      # the compiler cache evicts it. Measured on 2026-11-16:
+      #
+      #   run 43899667091  restored this cache (267 s) -> repo sync 460 s
+      #                    instead of 788 s, i.e. it is worth ~5 minutes
+      #   run 43899667091  saved 1.05 GB of ccache, which evicted this entry
+      #
+      # The compile phase of that run was ~43 of 88 minutes, so ccache is worth
+      # far more than 5 minutes even at a mediocre hit rate. ccache therefore
+      # owns the whole 10 GB and this stays off. It also keeps the size of a run
+      # predictable: repo sync is ~13 minutes, every time, instead of depending
+      # on which cache happened to survive.
+      #
+      # The restore step above is left enabled because it costs nothing on a miss
+      # and is a free 5 minutes on the rare run where the entry still exists.
       - name: Save source cache
-        if: steps.synccache.outputs.cache-hit != 'true'
+        if: false
         continue-on-error: true
         uses: actions/cache/save@v4
         with:
@@ -919,19 +933,15 @@ jobs:
           fi
           exit "$rc"
 
-      # Saved only when nothing was restored. That looks backwards, and it is,
-      # but it is deliberate: GitHub allows 10 GB of cache per repository and
-      # the *source* cache is 17.9 GB on its own. It survives only while
-      # nothing else is written, and the moment a ccache entry is saved GitHub
-      # evicts it as the least-recently-used oversized entry. That is exactly
-      # what happened at 11:38 -- run 43851152934 saved its ccache and the
-      # source cache vanished, so run 43860102276 had to repo sync from zero.
-      #
-      # Between "13 minutes of repo sync on every run" and "a ccache that is
-      # cold on every run that matters", the source cache is the better deal
-      # for now. If the source cache is ever dropped, flip this to always().
+      # Saved on every run, hit or miss. The old condition skipped the save
+      # whenever a cache was restored, which is the bug that kept the compiler
+      # cache at zero: each run restored whatever existed, compiled with it, and
+      # threw its own results away. The key carries the run id, so every save is
+      # a distinct entry and the restore-key prefix picks the newest; GitHub
+      # evicts the oldest once the repository passes 10 GB, which is now the
+      # intended behaviour rather than a collision with the source cache.
       - name: Save compiler cache
-        if: always() && steps.ccache_restore.outputs.cache-hit != 'true'
+        if: always()
         uses: actions/cache/save@v4
         with:
           path: ${{ env.CCACHE_DIR }}
