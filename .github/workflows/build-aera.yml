@@ -72,6 +72,18 @@ jobs:
       BUILD_TARGET: ${{ github.event.inputs.target || 'bootimage' }}
       DEVICE_BRANCH: ${{ github.event.inputs.device_branch || 'aera-16.0' }}
       WORKDIR: ${{ github.workspace }}/aera
+      # Compiler cache. AzzyC's builder -- the recipe this workflow is based on
+      # -- measured the same manifest at 2h06m for the build step without it and
+      # 1h28m with it, which is 38 minutes for ~4 GB of cache. That is worth
+      # more than any tuning of -j, because it removes work instead of
+      # redistributing it.
+      #
+      # USE_CCACHE/CCACHE_EXEC are the pair soong looks for; CCACHE_DIR has to
+      # live under github.workspace or the cache action cannot see it.
+      USE_CCACHE: "1"
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_MAXSIZE: 4G
+      CCACHE_COMPILERCHECK: content
 
     steps:
       # ---------------------------------------------------------------------
@@ -142,6 +154,24 @@ jobs:
           git config --global user.email "builder@github.local"
           git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
           git config --global url."https://github.com/".insteadOf "git@github.com:"
+
+      # ---------------------------------------------------------------------
+      # Compiler cache
+      # ---------------------------------------------------------------------
+      # A rolling key with a prefix restore-key: the exact key never matches, so
+      # every run restores the newest ccache that exists and then saves its own.
+      # That is deliberate -- a static key (what AzzyC's workflow uses) freezes
+      # the cache at the first successful save and stops improving, and this
+      # build is going to need several attempts before one survives.
+      - name: Restore compiler cache
+        id: ccache_restore
+        uses: actions/cache/restore@v4
+        continue-on-error: true
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: aera-ccache-${{ env.MANIFEST_BRANCH }}-${{ github.run_id }}
+          restore-keys: |
+            aera-ccache-${{ env.MANIFEST_BRANCH }}-
 
       # ---------------------------------------------------------------------
       # Source
@@ -477,6 +507,24 @@ jobs:
           ALLOW_MISSING_DEPENDENCIES: "true"
         run: |
           cd "${WORKDIR}"
+
+          # Compiler cache. Soong only uses ccache when USE_CCACHE and
+          # CCACHE_EXEC are both set in the build's own environment, and -z
+          # zeroes the counters so the stats at the end of this step describe
+          # this run instead of the history of the restored cache.
+          if command -v ccache >/dev/null 2>&1; then
+            export USE_CCACHE=1
+            export CCACHE_EXEC="$(command -v ccache)"
+            mkdir -p "${CCACHE_DIR}"
+            ccache -M "${CCACHE_MAXSIZE}" >/dev/null 2>&1 || true
+            ccache -z >/dev/null 2>&1 || true
+            echo "ccache: ${CCACHE_EXEC} max ${CCACHE_MAXSIZE} dir ${CCACHE_DIR}"
+            du -sh "${CCACHE_DIR}" 2>/dev/null || true
+          else
+            echo "::warning::ccache is not installed; building without a compiler cache"
+            unset USE_CCACHE CCACHE_EXEC
+          fi
+
           # The wiki is explicit: AERA_BUILD_DEVICE must be set in the calling
           # shell *before* envsetup is sourced, otherwise another tree's exports
           # can leak in and the vendorsetup guard never runs for this device.
@@ -654,7 +702,23 @@ jobs:
 
           df -h .
           free -h
+          if command -v ccache >/dev/null 2>&1; then
+            echo "=== ccache statistics ==="
+            ccache -s || true
+            du -sh "${CCACHE_DIR}" 2>/dev/null || true
+          fi
           exit "$rc"
+
+      # Saved even when the build fails. ccache is the only thing that makes a
+      # failed attempt cheaper than the last one, and the runner only runs steps
+      # when it is still alive -- which is exactly the distinction that has been
+      # making these failures so expensive.
+      - name: Save compiler cache
+        if: always() && steps.ccache_restore.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: aera-ccache-${{ env.MANIFEST_BRANCH }}-${{ github.run_id }}
 
       - name: Stop resource telemetry
         if: always()
