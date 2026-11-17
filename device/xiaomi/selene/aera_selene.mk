@@ -10,13 +10,17 @@
 # A flag in the wrong file is either a hard make error (readonly product vars)
 # or silently ignored.
 
-# The stock 4.14 MTK kernel has no usable WLAN firmware/libs in the recovery
-# ramdisk. Disable WLAN until a working bring-up is done.
+# WLAN is on. The dieD 4.19 kernel carries the MTK WLAN stack built in
+# (CONFIG_WLAN_DRV_BUILD_IN=y), and recovery/root/init.recovery.wifi.rc runs the
+# vendor connsys power sequence (wmt_loader -> wmt_launcher -> /dev/wmtWifi) with
+# the firmware staged in the ramdisk under /vendor. The stock 4.14 kernel has
+# none of that built in, which is why this was 0 when the port started.
 #
-# Verified against the consumer: aera_config.mk maps this verbatim to
-# OF_ENABLE_WLAN, and aera_defaults.go tests `getMakeVars(...) == "1"`, so
-# "0" really does keep WLAN off.
-AERA_ENABLE_WLAN := 0
+# aera_config.mk maps this verbatim to OF_ENABLE_WLAN, and aera_defaults.go
+# tests `getMakeVars(...) == "1"`. OF_ENABLE_WLAN=1 also pulls in the rest of
+# AERA's networking stack (ttyd, adb pairing, NAS); Android.mk trims rclone so
+# the image still fits the 64 MiB boot partition.
+AERA_ENABLE_WLAN := 1
 
 # Deliberately not set (confirmed by AzzyC, the AERA peridot maintainer):
 #

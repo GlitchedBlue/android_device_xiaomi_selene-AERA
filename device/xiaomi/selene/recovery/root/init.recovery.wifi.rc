@@ -1,0 +1,71 @@
+# MTK connsys / WLAN bring-up for the Redmi 10 (MT6768, selene).
+#
+# The dieD 4.19 kernel has the whole MTK WLAN stack built in
+# (CONFIG_WLAN_DRV_BUILD_IN=y, CONFIG_MTK_COMBO_WIFI=y), but the stock 4.14
+# kernel does not, which is why WLAN was disabled when this port started. The
+# kernel side needs nothing from us: the platform device 18000000.wifi is
+# already in the DTB and the driver binds the moment connsys is powered.
+#
+# What is missing at boot is the userspace power sequence. Nothing touches
+# connsys in recovery, so /dev/wmtWifi and wlan0 do not exist:
+#
+#   wmt_loader    powers the connectivity SoC, creates /dev/stpwmt
+#   wmt_launcher  downloads the ROM patch, runs calibration, keeps STP alive
+#   /dev/wmtWifi  writing 1 makes the WLAN driver register wlan0
+#
+# The loaders and the firmware they read are staged in the ramdisk under
+# /vendor, so this works before (and without) mounting the stock vendor.
+#
+# The slow part runs once at boot in a background oneshot service. That keeps
+# it off init's critical path while still letting a tap on "Start WLAN" finish
+# inside wlan.cpp's 20 s window: by then only `ifconfig wlan0 up` and the
+# supplicant start are left.
+
+on boot
+    start aera-wmt-loader
+    start aera-wmt-launcher
+    start aera-wlan-boot
+
+service aera-wmt-loader /vendor/bin/wmt_loader
+    user root
+    group root system
+    oneshot
+    disabled
+    seclabel u:r:recovery:s0
+
+service aera-wmt-launcher /vendor/bin/wmt_launcher -p /vendor/firmware/ -o 1
+    user root
+    group root system
+    disabled
+    seclabel u:r:recovery:s0
+
+# Waits for the launcher to finish the patch download and calibration, then
+# powers on the WLAN function and waits for wlan0. All of it is best effort:
+# if it fails, the on-demand path below tries again.
+service aera-wlan-boot /system/bin/sh /system/bin/aera-wlan-up.sh --boot
+    user root
+    group root wifi inet net_admin system
+    oneshot
+    disabled
+    seclabel u:r:recovery:s0
+
+# Fired by Wlan::StartInitSupplicantService() (wlan.cpp). AERA sets the
+# property and resets it here, so the next tap is a fresh 0->1 transition.
+on property:sys.aera.wlan.up=1
+    setprop sys.aera.wlan.up 0
+    mkdir /tmp/recovery 0777 root root
+    mkdir /tmp/recovery/sockets 0777 root root
+    start aera-wlan-up
+
+service aera-wlan-up /system/bin/sh /system/bin/aera-wlan-up.sh
+    user root
+    group root wifi inet net_admin system
+    oneshot
+    disabled
+    seclabel u:r:recovery:s0
+
+service wpa_supplicant /vendor/bin/hw/wpa_supplicant -Dnl80211 -iwlan0 -dd -O/tmp/recovery/sockets -c/vendor/etc/wifi/wpa_supplicant.conf
+    user root
+    group root wifi inet net_admin
+    disabled
+    seclabel u:r:recovery:s0
