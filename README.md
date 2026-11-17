@@ -31,7 +31,7 @@ This tree **builds, boots and works**. It is a bring-up port, not a release.
 | Boot / UI / touch | **Works** |
 | FBE decryption | **Works** (run #4 + the VINTF fix) |
 | Backup / restore / zip install | **Works** |
-| GPU acceleration | **In progress** — every GPU path is proven on the device; the fix for the black screen is a CI defect that is now corrected (see below) |
+| GPU acceleration | **Works** — run `43961488385` (`ca912c22`); the Mali backend composites the AERA UI on the device (see below) |
 
 ### Verified on the device
 
@@ -43,35 +43,54 @@ This tree **builds, boots and works**. It is a bring-up port, not a release.
   marker;
 - the MTK boot-control HAL stays up (`init.svc.boot-hal-1-2` → `running`), so
   slot and wipe operations work;
+- the UI is composited on the Mali GPU: `/dev/mali0` open in the recovery
+  process, `libGLES_mali.so` mapped, composer in-process, 12-24 fps while
+  touching the screen;
 - USB mass storage works.
 
 ### Known limitations
 
-- **~4 fps.** The UI runs on the software renderer because the Mali backend
-  cannot initialise — see below. It rasterises 1440×3200 and downscales to
-  1080×2400, which is ~1.8× more pixels than the screen has.
-- **No MTP.** The kernel is built without `CONFIG_USB_CONFIGFS_F_MTP`. Use
-  *Mount → USB Storage* instead.
-- **GPU acceleration is in progress.** selene's Android 13 vendor ships gralloc4
-  (HIDL `allocator@4.0` + `mapper@4.0`) and **no gralloc1 module**, while the Mali
-  backend calls `gralloc1_open()`. `device/xiaomi/selene/gralloc1_compat/` builds
-  `libaera_gralloc1.so`, a gralloc1 shim over MediaTek's exported
-  `mali_gralloc_buffer_allocate`/`_free`, published as `gralloc.mt6768.so` and
-  staged from the blob store like the other vendor libraries. Until it
-  initialises, the UI falls back to software rendering.
-
-  The black screen was **not** the shim. The CI build job had no
-  `actions/checkout`, so `${GITHUB_WORKSPACE}/patches` never existed, and with
-  `globstar nullglob` the patch loop ran zero iterations and stayed green
-  (`patches applied: 0`). The shipped `recovery` binary provably contains none
-  of `patches/bootable/recovery/*.patch`. Every path is now proven on the device
-  with `gralloc1-probe`: hotplug alone leaves display 0 disconnected, while
-  vsync + refresh + hotplug + a second hotplug connects it; `AB24` dma-buf
-  import renders and presents with real release fences. The build now greps the
-  compiled binary for the patch markers and fails instead of publishing another
-  unpatched image. Evidence and the full sequence are in `HANDOFF.md`.
+- **MTP is unavailable.** The kernel is built without
+  `CONFIG_USB_CONFIGFS_F_MTP`. Use *Mount → USB Storage* instead.
+- **The UI is rasterised at 1440×3200 and downscaled to 1080×2400** — ~1.8× more
+  pixels than the screen has. That is an AERA-side constant, not a driver issue.
 - **`aera backup --parts` needs TWRP-style mount points**: `--parts boot` fails
   silently, `--parts /boot` works. The GUI is unaffected.
+
+### GPU acceleration
+
+Working since run `43961488385` (`ca912c22`). On the device the recovery process
+holds `/dev/mali0` open with Mali timeline fences, maps `libGLES_mali.so` and the
+MediaTek composer, and the kernel's GPU governor cycles under interaction while
+the composer reports 12-24 fps against 1 fps idle — i.e. frames are being
+submitted to the GPU and nothing redraws when idle.
+
+Three independent defects had to be fixed, and each one failed **silently**:
+
+1. **The build never applied the patches.** The job had no `actions/checkout`, so
+   `${GITHUB_WORKSPACE}/patches` never existed; with `globstar nullglob` the loop
+   ran zero iterations and stayed green (`patches applied: 0`). The shipped
+   binary provably contained none of `patches/bootable/recovery/*.patch`. See
+   fix 3 [below](#three-non-obvious-fixes-this-port-needs).
+2. **Display 0 was never connected.** Registering `HWC2_CALLBACK_HOTPLUG` alone
+   leaves it disconnected: `HWCMediator::deviceRegisterCallback()` runs
+   `DisplayManager::init()` from the **vsync** callback, so the hotplug that
+   arrives during init is lost. The patch registers vsync, refresh, hotplug and
+   then hotplug again, with a bounded 2 s poll as a floor.
+3. **The composer was being unloaded.** Recovery `dlclose()`d the composer HAL
+   after init, taking the display with it. Patch `0001` keeps it resident.
+
+Scanout buffers are imported as dma-bufs (`EGL_EXT_image_dma_buf_import`, fourcc
+`AB24`) instead of copied. `device/xiaomi/selene/gralloc1_compat/` supplies the
+gralloc1 module the Mali backend calls `gralloc1_open()` for — selene's Android
+13 vendor ships only gralloc4 — by `dlsym`ing MediaTek's exported
+`mali_gralloc_buffer_allocate`/`_free`. It is 64-bit only: the 32-bit build
+cannot see the 64-bit allocator.
+
+The `AeraGpu` INFO lines are not in `logcat` on a running device because the main
+ring buffer is only 256 KiB and the kernel's GPU-DVFS chatter fills it within
+minutes. `/proc/<pid>/maps` and the open `malitl_*` fence fds are the reliable
+witness. Evidence and the full sequence are in `HANDOFF.md`.
 
 ## Build
 
@@ -93,7 +112,7 @@ trees, measured on the same manifest and the same runner class (see
 
 | piece | what it buys | why it is set this way |
 | --- | --- | --- |
-| **ccache**, 10 GB budget | build step 2h06m → 1h28m | Soong on android16 ignores `USE_CCACHE`; the compiler wrapper comes from `CC_WRAPPER` in the environment, which is what the Build step exports. Measured **17520/17522 hits (99.99%)** when the sources did not change. The cache owns the whole 10 GB free-tier budget, so the source-cache *save* is disabled and the ccache save runs `if: always()` |
+| **ccache** | build step 2h06m → 1h28m | Soong on android16 ignores `USE_CCACHE`; the wrapper comes from `CC_WRAPPER` in the environment, which the Build step exports explicitly. Measured **17520/17522 hits (99.99%)** when the sources did not change, 1.1 GB of a 4 GB cap, 1.05 GB archive. The ccache save runs `if: always()` and the source-cache *save* is disabled so the two never fight over the 10 GB free-tier budget |
 | **`.repo` source cache** | ~12 min per attempt | restore 18.8 GB in 3m39s + sync 3m46s ≈ 7m30s, against ~20 min cold. It is an 18.8 GB entry and still restores fine — do not "fix" it by trimming the path |
 | **zram + 30 GB swapfile** | keeps Soong alive | Soong analysis peaks at ~30 GB live on a 16 GB runner. zram (lz4, ~2.5×) is swapon'd at priority 100 so it fills first and the swapfile only catches what will not compress. The 30 GB swap is what actually survives; `GOMEMLIMIT` does not |
 | `GOGC=40` / `GOMEMLIMIT=11GiB` / `GOMAXPROCS=2` | bounds Soong's Go heap | 14 GiB was tried and made no difference — the working set is genuinely ~30 GB |

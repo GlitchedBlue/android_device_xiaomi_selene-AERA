@@ -1,8 +1,127 @@
 # Handoff / current status
 
-Last updated: 2026-11-15 (recovery boots, decrypts and browses files; the Mali
-driver now loads under the dieD 4.19 kernel; run #8 adds the gralloc1 shim that
-supplies the one HAL the backend was missing)
+Last updated: 2026-11-17 (**Mali GPU acceleration works on the device.** Build
+`43961488385` (`ca912c22`) produced a `boot.img` whose recovery binary carries
+all three GPU patches, and the flashed image composites the AERA UI on the Mali
+GPU. The black screen that cost weeks was a CI defect -- the build job never
+checked this repository out, so `patches applied: 0`)
+
+## GPU acceleration: works
+
+Flashed, booted and confirmed on the device on 2026-11-17. The AERA UI is
+composited by the Mali GPU and presented through the MediaTek composer HAL, which
+runs **inside** the recovery process.
+
+### What was built
+
+| | |
+| --- | --- |
+| run | `43961488385`, commit `ca912c22`, job `133629762686` |
+| result | success; Build step 21:55:28 -> 22:28:08 UTC (32m40s, warm ccache) |
+| `boot.img` | 67,108,864 B, md5 `440DFF5DFEAD935D5B3101797F40252E` |
+| repacked onto the dieD 4.19 kernel | 67,108,864 B, md5 `749DE5C7C8270F2FDF3D81DC8847FE04` |
+| `/system/bin/recovery` | 11,053,408 B, md5 `6173f6a3ca442240702639eacb3cece4` |
+| rollback | `/sdcard/boot_stock_android.img`, md5 `65275652ea012c5b04f85207c4d23627` |
+
+The repack is required: AERA's `boot.img` carries its own kernel, and only the
+dieD 4.19 kernel boots on this device. `repack_died.py` takes the kernel,
+recdtbo and dtb from `boot_a.img` and the ramdisk from AERA's image.
+
+### Why the binary is the proof, not the log
+
+```
+$ grep -ac "vsync/refresh registration" /system/bin/recovery
+1
+$ grep -ac "dma-buf import %u failed" /system/bin/recovery
+1
+```
+
+Both are `Fail()` strings that exist only in the patched source. The workflow
+asserts them after the build, so a green run cannot ship an unpatched image
+again.
+
+### Why the GPU is the proof, not the fps counter
+
+```
+$ grep -aE 'libGLES_mali|hwcomposer|gralloc' /proc/409/maps | awk '{print $6}' | sort -u
+/gpu/stock-vendor/lib64/egl/libGLES_mali.so
+/gpu/stock-vendor/lib64/hw/hwcomposer.mt6768.so
+/gpu/stock-vendor/lib64/libgralloc_extra.so
+/gpu/stock-vendor/lib64/libgralloc_metadata.so
+/gpu/stock-vendor/lib64/libgralloctypes.so
+/gpu/stock-vendor/lib64/libgralloctypes_mtk.so
+
+$ ls -l /proc/409/fd | grep -a mali
+lr-x------ ... 19 -> anon_inode:malitl_409_0xb4000073c26de090
+lr-x------ ... 20 -> anon_inode:malitl_409_0xb4000073426dd7d0
+lrwx------ ...  8 -> /dev/mali0
+```
+
+`/dev/mali0` open in the recovery process, plus two `malitl_*` timeline fences,
+means the Mali driver is executing jobs for pid 409 and the process is waiting on
+their completion. Nothing else in recovery opens the GPU: the composer HAL drives
+the display engine (OVL/MDP), not the shader cores.
+
+The kernel agrees -- the MTK GPU governor is cycling while the UI is touched:
+
+```
+[GPU/DVFS][INFO]@__mt_gpufreq_update_max_limited_idx: g_max_limited_idx = 3, g_limiter = 4
+[GPU/DVFS][INFO]@__mt_gpufreq_update_max_limited_idx: g_max_limited_idx = 0, g_limiter = -1
+```
+
+and the composer reports `Display_0 (type:1) fps:12.2-23.9` under interaction
+against `fps:0.99` idle.
+
+### The AeraGpu log lines are missing, and that is expected
+
+`logcat -d -s AeraGpu` returns nothing even though the binary contains the
+`"zero-copy native-buffer GPU ready: EGL %d.%d, ..."` string. The main ring
+buffer on this build is **256 KiB** and the kernel's GPU-DVFS chatter wraps it in
+minutes:
+
+```
+main: ring buffer is 256 KiB (253 KiB consumed, 2 MiB readable)
+kernel: ring buffer is 256 KiB (209 KiB consumed, 695 KiB readable)
+```
+
+Do not read the absence as a fallback. Check `/proc/<pid>/maps` instead.
+
+Also note `cannot find/open a drm device ... Using fbdev graphics` in
+`/tmp/recovery.log`: that is TWRP's minui backend drawing the very first frames,
+and it is unrelated to the AERA UI path.
+
+### The three defects, in the order they were found
+
+1. **No checkout in the build job.** `${GITHUB_WORKSPACE}/patches` did not exist,
+   `globstar nullglob` turned the loop into a no-op, and the step reported
+   success. Fixed in `b26df280`: checkout at `path: src`, guards on directory /
+   glob / count, and a post-build grep of the binary for the markers.
+2. **Display 0 never connected.** `HWCMediator::deviceRegisterCallback()` runs
+   `DisplayManager::init()` from the **vsync** callback, so a hotplug delivered
+   during init is dropped. Patch `0002` registers vsync, refresh, hotplug, then
+   hotplug again, with a bounded 2 s poll behind it.
+3. **The composer was unloaded.** Recovery `dlclose()`d the composer HAL after
+   init. Patch `0001` keeps it resident.
+
+Plus `0003`, which imports the scanout buffers as dma-bufs
+(`EGL_EXT_image_dma_buf_import`, fourcc `AB24`, pitch `stride*4`, offset 0)
+instead of copying them, and the `gralloc1_compat` shim, which had to be
+arm64-only (`compile_multilib: "64"`, fixed in `deccfd07`) because the 32-bit
+build cannot resolve the 64-bit allocator's symbols.
+
+### Flashing, and how to get back
+
+```sh
+adb push boot_died_aera_43961488385.img /data/local/tmp/aera_new.img
+adb shell dd if=/dev/block/by-name/boot_a of=/sdcard/boot_stock_android.img bs=1M
+adb shell dd if=/data/local/tmp/aera_new.img of=/dev/block/by-name/boot_a bs=1M conv=fsync
+adb shell md5sum /dev/block/by-name/boot_a      # must be 749de5c7c8270f2fdf3d81dc8847fe04
+adb reboot
+```
+
+`boot_a` is `mmcblk0p27`. To roll back, `dd` `/sdcard/boot_stock_android.img`
+back over it. AVB is not enforced here, so no re-signing is needed.
+
 
 ## Read this first
 
@@ -1031,7 +1150,60 @@ Run #7 measured, for future reference: 148 min wall, of which `Cleanup` 4.4,
 | #10 `43788533915` | failure, 62 min | `Build` at ~36 min | same |
 | #11 `43810934391` | failure, 59 min | `Build` at ~46 min | same, but with `-j3` and `GOMEMLIMIT 6GiB` |
 | #12 `43822760838` | cancelled | `Sync` | superseded by the instrumented build; it carried the disk test but no witness |
-| #13 `43824966283` | in flight | — | swap 8 GB, ccache, commit-comment telemetry, disk watchdog |
+| #13 `43824966283` | failure, 79 min | `Build` at ~47 min | swap 8 GB, ccache, commit-comment telemetry, disk watchdog. Witness posted twice then went silent |
+| #14 `43834716401` | failure, 65 min | `Build` at ~47 min | witnesses moved inside `Build`; sampler hung on a timed-out `sudo dmesg` at t+155s |
+| #15 `43835500987` | failure, 20 min | `Build` at 5 min | **runner shutdown signal**, exit 143, during the soong analysis peak |
+| #16 `43851152934` | in flight | - | swap back to 30 GB, `GOMEMLIMIT 11GiB`, `-j` default, fixed sampler |
+
+### The runner is being shut down, and the analysis peak is 14 GB (2026-11-16, final)
+
+Run #15 is the first failure that ended normally, so it is the first one whose
+log exists. It says plainly what happened:
+
+```
+10:16:56 Got signal: terminated
+soong bootstrap failed with: signal: terminated
+##[error]The runner has received a shutdown signal.
+##[error]Process completed with exit code 143.
+```
+
+That is a shutdown, not a compile error and not a full disk. It landed five
+minutes into `Build`, while soong was still analysing `Android.bp`.
+
+The sampler recorded why the box was that fragile: `soong_build` at **14.9 GB
+RSS on a 16 GB machine**, with swap climbing at ~50 MB/s to 5.7 of the 8 GB
+available. `MemAvailable` is what matters, not `free`'s "used". The analysis
+peak happens in the first five minutes, before any clang runs, so it is not the
+compile that needs the memory.
+
+`GOMEMLIMIT` does not help: soong does not set it (checked in
+`ui/build/{soong,config}.go`), the variable does reach `soong_build`, but it is
+a *soft* limit and the analysis genuinely needs ~14 GB live. There is nothing
+to collect, so a lower limit only burns CPU. Do not lower it expecting a win.
+
+**Run #7 is the only green image and the only trustworthy config.** It used
+30 GB swap and `GOMEMLIMIT 11GiB`. Every failure since used less of one or the
+other. The 8 GB swap experiment was a guess that the vanishing runner was a
+full disk; there is no evidence for it and it starved the analysis peak. Both
+are restored, `-j3` is dropped, and the only deliberate difference from #7 is
+now the time budget.
+
+The ~46 minute band is still not explained by any single mechanism: #8 (~30 GB
+swap) and #14 (11 GB swap) both died there, and #7 ran 133 minutes of `Build`
+on the same runner class, so no wall clock exists in general. Disk and `out/`
+are now sampled every 30 s so that the disk explanation can be confirmed or
+killed with numbers rather than with a swap-size guess.
+
+### The sampler must not use subprocess timeouts
+
+The witness in #14 posted at t+0, t+31s, t+62s, t+93s, t+124s, t+155s and then
+went silent while the job lived another 46 minutes. Cause: `subprocess.run(
+timeout=)` kills only its direct child, and `sudo dmesg | tr | cut` left
+grandchildren holding the pipe, so the follow-up `communicate()` blocked
+forever. The shell `timeout` binary now goes *inside* the command so the whole
+pipeline dies, and mem/swap/load/PSI are read straight from `/proc`, which
+still works while the box is thrashing.
+
 
 ### The runner dies ~46 minutes into `Build` (2026-11-16, revised)
 
@@ -1309,3 +1481,139 @@ A recovery you can boot and flash from beats a perfect one that never compiles.
 
 - `.gh_token` in this folder is a personal PAT used for the REST pushes.
   **Revoke it when the project is done.**
+
+## 2026-11-16: why the GPU never appeared (the build compiled the wrong tree)
+
+The shipped `/system/bin/recovery` contains **none** of
+`patches/bootable/recovery/*.patch`, and that is not a guess: the binary embeds
+`.gnu_debugdata`, so it can be asked which functions it has. It exports
+`_ZN6aeraui11MaliDisplay4Impl7HotplugEPvmi` (pristine) but neither `Impl::Vsync`
+(patch 0002) nor `MaliDisplay::DescribeBuffer` (patch 0003); none of the patches'
+log strings are in it; and its `.text` is byte-identical to the image built the
+day before those patches existed.
+
+The reason is in the job log of run `43899667091`:
+
+```
+##[group]Run cd "${WORKDIR}"
+root="${GITHUB_WORKSPACE}/patches"
+shopt -s globstar nullglob
+...
+patches applied: 0
+```
+
+The build job has **no `actions/checkout` step**. It creates `${WORKDIR}`,
+`repo init`/`repo sync`s there, and clones this repository only into `/tmp/dt` to
+copy `device/xiaomi/selene` out of it. The patch loop pointed at
+`${GITHUB_WORKSPACE}/patches`, a directory that never existed, and with
+`globstar nullglob` an empty glob is a zero-iteration loop: the step printed
+`patches applied: 0`, the following `git diff --stat` printed nothing, and the
+job stayed green.
+
+That explains the device exactly. Without 0002 the composer is asked for hotplug
+alone, never marks display 0 connected, and `MaliDisplay::Initialize()` returns
+`primary display discovery failed`; without 0001 the composer is still
+`dlclose`d, so that failure turns into `~AsyncBlitDevice` -> `Scudo ERROR:
+misaligned pointer` and a recovery restart every ~5 s (black screen).
+
+### Fix (commit `b26df280`)
+
+- `actions/checkout@v4` with `path: src`; the device tree **and** the patches
+  both come from that one checkout, so the separate `/tmp/dt` clone is gone.
+- The patch step refuses to run if `src/patches` is missing, materialises the
+  glob into an array and fails if it is empty, compares applied count against
+  file count, greps the patched tree for every marker, and after the build greps
+  the produced `recovery` binary for `vsync/refresh registration` and
+  `dma-buf import %u failed`.
+- 0002 gained the second half of the sequence the probe measured: register
+  vsync, refresh, hotplug, **then hotplug again** (DisplayManager's synthetic
+  "display 0 connected" is delivered to a callback registered *after* `init()`
+  has run), plus a bounded 2 s poll instead of a single test.
+
+A new concurrency group (`aera-selene-v2`, commit `00a98c62`) was needed because
+run `43936328986` -- the pre-fix build -- ignored three cancellation requests and
+held the old group for over an hour.
+
+## 2026-11-16: the probe re-proves every GPU path on the device
+
+Rebuilt from the `gralloc1-shim` CI artifact and run in the failing recovery
+(`LD_LIBRARY_PATH=/gpu/lib64:/gpu/stock-vendor/lib64:/system/lib64`):
+
+| probe | result |
+| --- | --- |
+| `--hotplug --only-hotplug` (what the shipped binary does) | `connected_right_after=0`, `waited 5000 ms connected=0`, display `~0ull`, `configs: display=0 -> 2, 0 config(s)` |
+| `--hotplug` (vsync + refresh + hotplug + hotplug again) | `hotplug : display=0 state=1`, `connected=1 callbacks=2 display=0`, `configs: display=0 -> 0, 2 config(s)` |
+| `--egl` (dma-buf import, patch 0003) | `AB24 -> ok`, `framebuffer complete`, `render: glReadPixels -> 255 0 0 255`, `raw: mmap fd=17 centre pixel 255 0 0 255` |
+| `--present` | layer created, 3 frames `present=0` with release fences 29 and 32, `fences: 0 count=0` |
+
+Two details worth keeping:
+
+- The fourcc matrix fails on the first buffer (`AB24/AR24/... -> 0x3003`) and
+  succeeds on the next one. The first import attempt leaves the driver unhappy;
+  the code that matters (a real frame) imports fine. Do not read the matrix as a
+  format list.
+- Mounting `/vendor` from the rescue partition (bind mount of
+  `/gpu/stock-vendor`) changes nothing for the EGL import; `cust_pq.xml` is
+  simply absent from that image and the warning is harmless.
+
+Both probe runs end in `SIGABRT` at **process exit** (`~AsyncBlitDevice` via
+`libutils`, `pthread_mutex_lock called on a destroyed mutex`). That is the
+vendor's Android 12 destructor under Android 16's allocator, i.e. exactly what
+patch 0001 exists to avoid: recovery must never unload the composer, and it never
+exits on its own.
+
+## Run history (2026-11-16)
+
+| run | commit | outcome |
+| --- | --- | --- |
+| `43899667091` | `b0944852` | first image with zram + ccache; **`patches applied: 0`**; failed only on `libaera_gralloc1.so was not produced` |
+| `43936328986` | `b6d4bff2` | pre-fix patch step, ignored three cancels, group moved to v2 and abandoned |
+| `43944418037` | `b26df280` | queued behind the stuck run |
+| `43946297647` | `00a98c62` | first build with the checkout fix, the extended 0002 and the binary marker assertion |
+
+## Device state
+
+- `boot_a` holds the **stock Android boot image** again, md5
+  `65275652ea012c5b04f85207c4d23627` (verified on the partition after `dd`).
+  `boot_stock_1116.img` is also at `/data/local/tmp/boot_stock.img`.
+- The failing AERA candidate is `boot_died_aera_43936328986_src.img` locally
+  (md5 `77bccad4bce17a837d3973d43f0d8481`), ready to flash back for comparison.
+- The blob store survived: `/gpu-rescue/aera-gpu` (partition `mmcblk0p50`).
+- `/sdcard` is empty in recovery because userdata is not mounted there; the stock
+  image had to be pushed to `/data/local/tmp` instead.
+
+## Next
+
+1. When `43946297647` lands green, check the log for `patch markers verified in
+   the working tree`, `patch marker present: vsync/refresh registration` and
+   `patches applied: 3`. If any of those is missing the build now fails instead
+   of shipping another unpatched image.
+2. Pull only `boot.img` from the release, `python repack_died.py`, flash
+   `boot_a`, verify md5, reboot to recovery.
+3. Expect in logcat: `[HWC] Register vsync callback`, `Register refresh
+   callback`, `hotplug : display=0 state=1`, then a real frame. Then run
+   `--present` and `--egl` from the probe for the end-to-end check.
+
+## 2026-11-16: the shim was being built 32-bit
+
+Run `43936328986` finished its build and then failed its own assertion:
+
+```
+gralloc shim built: out/soong/.intermediates/device/xiaomi/selene/gralloc1_compat/
+  libaera_gralloc1/android_arm_armv8-2a_shared/unstripped/libaera_gralloc1.so
+##[error]libaera_gralloc1.so is not an AArch64 object
+  Class: ELF32   Machine: ARM
+```
+
+`device/xiaomi/selene/gralloc1_compat/Android.bp` had no arch restriction, so
+Soong built both ABIs and the assertion's `find ... -print -quit` picked the
+32-bit one. A 32-bit shim can never be loaded by the 64-bit recovery, so this is
+a real defect in the tree. Fixed in `deccfd07` with `compile_multilib: "64"`,
+and the workflow now scans every `libaera_gralloc1.so` and uses the AArch64 one
+instead of trusting `find` order.
+
+That run also reported the cache state: **17520 of 17522 cacheable calls were
+ccache hits (99.99%)**, because both images so far were built from
+byte-identical *unpatched* sources. Once the patches actually apply, only the
+touched files miss, so the compile phase should be minutes and soong analysis
+(~25 min) dominates.
