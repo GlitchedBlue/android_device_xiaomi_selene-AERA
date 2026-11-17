@@ -69,6 +69,30 @@ bringup() {
     return 1
 }
 
+# Some kernels build the WLAN driver as modules instead of linking it in (no
+# CONFIG_WLAN_DRV_BUILD_IN). The connsys power sequence still succeeds and
+# /dev/wmtWifi still accepts the power-on, but nothing registers a netdev, so
+# wlan0 never appears and the failure looks identical to a broken power
+# sequence. Load what the kernel shipped, in dependency order, from the rescue
+# blob store first and then the vendor/system module dirs.
+#
+# insmod is allowed to fail: a .ko built for another kernel fails with
+# "invalid module format" and there is nothing to do about it here, but the
+# in-tree case needs no module at all, so log and carry on either way.
+load_wlan_modules() {
+    local dir mod
+    for dir in /gpu-rescue/aera-modules /vendor/lib/modules /system/lib/modules; do
+        [ -d "$dir" ] || continue
+        for mod in wmt_drv.ko wmt_chrdev_wifi.ko wlan_drv_gen4m.ko; do
+            [ -f "$dir/$mod" ] || continue
+            grep -q "^${mod%.ko} " /proc/modules && continue
+            insmod "$dir/$mod" 2>>"$LOG"
+            log "insmod $dir/$mod rc=$?"
+        done
+    done
+    : > /tmp/.aera-wlan-modules-tried
+}
+
 # Writing 1 to /dev/wmtWifi asks the WLAN driver to power the WiFi function and
 # register wlan0. Do not write it again once wlan0 exists: a second power-on
 # request on an already-running function is rejected and logs
@@ -76,6 +100,7 @@ bringup() {
 power_on_wifi() {
     local i=0
     [ -e /sys/class/net/wlan0 ] && return 0
+    [ -e /tmp/.aera-wlan-modules-tried ] || load_wlan_modules
     while [ "$i" -lt "$1" ]; do
         if [ -e /dev/wmtWifi ]; then
             echo 1 > /dev/wmtWifi
