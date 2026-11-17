@@ -69,6 +69,16 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# Assemble the kernel prebuilt
+# ---------------------------------------------------------------------------
+# The 12.4 MB Image.gz is over the GitHub blob size limit, so the tree stores
+# it split as Image.gz.00 + .01. Join it here; the script checks the size and
+# md5, which turns a truncated part into an immediate failure instead of a
+# kernel that builds and does not boot.
+log "Assembling the kernel prebuilt"
+"device/xiaomi/$DEVICE/prebuilt/assemble-kernel.sh"
+
+# ---------------------------------------------------------------------------
 # Build
 # ---------------------------------------------------------------------------
 log "Building twrp_$DEVICE-bp2a-eng"
@@ -89,5 +99,6 @@ log "Build finished. Artifacts in $OUT_DIR:"
 ls -lh "$OUT_DIR"/AERA-*.img "$OUT_DIR"/boot.img 2>/dev/null || true
 echo
 echo "Flash the AERA boot image with:"
-echo "  fastboot flash boot $OUT_DIR/AERA-R1.0-Alpha-Unofficial-$DEVICE.img"
-echo "Read docs/FLASHING.md before flashing."
+echo "  fastboot flash boot $OUT_DIR/boot.img"
+echo "It is a dual-boot image: the ROM boots normally, 'adb reboot recovery'"
+echo "starts AERA. Read docs/FLASHING.md before flashing."
