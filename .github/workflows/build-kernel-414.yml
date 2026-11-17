@@ -80,6 +80,23 @@ jobs:
           echo '--- after'
           grep -n 'MTK_GPU_VERSION\|MTK_GPU_SUPPORT' arch/arm64/configs/selene_defconfig
 
+      - name: Adapt the r32p1 glue to the 4.14 gpufreq API
+        working-directory: ${{ runner.temp }}/kernel
+        run: |
+          # r32p1's platform glue is written against the 4.19 gpufreq API:
+          #   mt_gpufreq_target(unsigned int opp_idx, enum kir_reason policy)
+          # This tree's 4.14 core has:
+          #   mt_gpufreq_target(unsigned int request_idx, bool is_real_idx)
+          # and the r25p0 glue that already builds in this same tree calls it
+          # with `false` (the request index is a logical OPP index, so the
+          # segment offset still has to be applied). Use the same call.
+          GLUE=drivers/misc/mediatek/gpu/gpu_mali/mali_valhall/mali-r32p1/drivers/gpu/arm/midgard/platform/mtk_platform_common/mtk_platform_common.c
+          grep -n 'KIR_POLICY' "$GLUE" || {
+            echo 'ERROR: KIR_POLICY call site disappeared; re-check this patch'; exit 1; }
+          sed -i 's|mt_gpufreq_target(opp_idx, KIR_POLICY)|mt_gpufreq_target(opp_idx, false)|' "$GLUE"
+          grep -n 'mt_gpufreq_target' "$GLUE"
+          grep -rn 'KIR_' "$GLUE" || echo 'no KIR_ references left in the glue'
+
       - name: Build Image.gz and dtbs
         working-directory: ${{ runner.temp }}/kernel
         run: |
