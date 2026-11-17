@@ -57,18 +57,26 @@ TARGET_SCREEN_DENSITY := 440
 # The stock MIUI 4.14 kernel cannot run this userspace: it has no
 # CONFIG_WLAN_DRV_BUILD_IN and ships Mali r26p0 against r32p1 userspace, so the
 # image it produced had neither WiFi nor GPU acceleration. dieD's 4.19 build has
-# both, boots the stock system, and is what the verified images use. The load
-# addresses below are the ones in that kernel's boot image; do not change them
-# without re-checking the resulting image.
+# both, boots the stock system, and is what the verified images use.
+#
+# Addresses: mkbootimg writes kernel_addr = BASE + BOARD_KERNEL_OFFSET, and
+# BOARD_KERNEL_OFFSET defaults to 0x8000. The dieD boot image's header says
+# kernel 0x40080000, ramdisk 0x47c80000, tags 0x4bc80000, dtb 0x4bc80000, so
+# the base is 0x40078000 and each offset carries the 0x8000. Setting BASE to
+# 0x40080000 (the absolute kernel address) produced kernel_addr 0x40088000 --
+# run 44142992180 shipped that and it cannot boot. Keep the arithmetic.
 # ---------------------------------------------------------------------------
 BOARD_BOOT_HEADER_VERSION := 2
 # Kept for the TWRP/AERA boot-image tooling that still reads this name.
 BOARD_BOOTIMG_HEADER_VERSION := 2
-BOARD_KERNEL_BASE := 0x40080000
+BOARD_KERNEL_BASE := 0x40078000
 BOARD_KERNEL_CMDLINE := bootopt=64S3,32N2,64N2
 BOARD_KERNEL_PAGESIZE := 2048
-BOARD_RAMDISK_OFFSET := 0x07c00000
-BOARD_KERNEL_TAGS_OFFSET := 0x0bc00000
+BOARD_RAMDISK_OFFSET := 0x07c08000
+BOARD_KERNEL_TAGS_OFFSET := 0x0bc08000
+# AOSP defaults this to 0x01f00000, which put the DTB at 0x41f80000 in that
+# image. The dieD image has it at 0x4bc80000, alongside the tags.
+BOARD_DTB_OFFSET := 0x0bc08000
 BOARD_KERNEL_IMAGE_NAME := Image.gz
 TARGET_PREBUILT_KERNEL := $(DEVICE_PATH)/prebuilt/Image.gz
 TARGET_PREBUILT_DTB := $(DEVICE_PATH)/prebuilt/dtb.img
