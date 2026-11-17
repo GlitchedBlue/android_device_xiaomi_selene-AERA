@@ -222,7 +222,26 @@ TW_LEDS_HAPTICS_DIR := /sys/devices/platform/odm/odm:vibrator@0/leds/vibrator
 # Storage / USB
 # ---------------------------------------------------------------------------
 RECOVERY_SDCARD_ON_DATA := true
-AERA_INCLUDE_FUSE_EXFAT := true
+# Mount exFAT with the kernel driver, not exfat-fuse.
+#
+# AERA_INCLUDE_FUSE_EXFAT was a no-op: nothing in the AERA 16 recovery tree reads
+# it. The real switch is TW_NO_EXFAT_FUSE (aera_config.mk maps AERA_NO_EXFAT_FUSE
+# to it, and Android.mk turns it into -DTW_NO_EXFAT_FUSE).
+#
+# exfat-fuse is broken on this kernel. It mounts and lists directories, but
+# every read returns nothing, so MTP copy from the card fails with Windows'
+# 0x80040005 and any backup or zip install that reads the card silently gets
+# zero bytes. On the device:
+#
+#   /sdcard1/Id.pdf            557373 bytes
+#   head -c 64 /sdcard1/Id.pdf | wc -c   -> 33   (should be 64)
+#   dd if=/sdcard1/Id.pdf bs=512 count=1 -> 0 bytes copied
+#
+# The dieD 4.19 kernel has CONFIG_EXFAT_FS built in (it is in /proc/filesystems),
+# and mounting the same partition with -t exfat reads and writes correctly:
+# 2257935 bytes at 12 MB/s, and a write/read round trip. With this flag
+# partition.cpp skips the fuse mount and calls mount(2) with "exfat".
+TW_NO_EXFAT_FUSE := true
 AERA_INCLUDE_FUSE_NTFS := true
 AERA_INCLUDE_NTFS_3G := true
 TARGET_USE_CUSTOM_LUN_FILE_PATH := /config/usb_gadget/g1/functions/mass_storage.usb0/lun.%d/file

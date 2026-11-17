@@ -32,6 +32,8 @@ This tree **builds, boots and works**. It is a bring-up port, not a release.
 | FBE decryption | **Works** (run #4 + the VINTF fix) |
 | Backup / restore / zip install | **Works** |
 | GPU acceleration | **Works** — run `43961488385` (`ca912c22`); the Mali backend composites the AERA UI on the device (see below) |
+| MTP | **Works** — FunctionFS (`ffs.mtp`), no kernel `f_mtp` needed |
+| exFAT MicroSD | **Works** — kernel `exfat` driver; `exfat-fuse` is broken on this kernel |
 
 ### Verified on the device
 
@@ -46,12 +48,42 @@ This tree **builds, boots and works**. It is a bring-up port, not a release.
 - the UI is composited on the Mali GPU: `/dev/mali0` open in the recovery
   process, `libGLES_mali.so` mapped, composer in-process, 12-24 fps while
   touching the screen;
+- MTP enumerates as `USB\VID_2717&PID_FF48` (WPD device "Redmi 10"); Explorer
+  shows *Internal Storage* and *MicroSD*, and a file copied from Windows landed
+  in `/data/media/0` with matching contents;
+- the MicroSD card mounts with the kernel exFAT driver (`/sdcard1` is
+  `type exfat`, not `fuseblk`) and reads a 2.2 MB JPEG at ~12 MB/s;
 - USB mass storage works.
+
+### MTP and exFAT
+
+Both problems looked like kernel gaps and neither was one.
+
+**MTP** is FunctionFS, not the kernel `f_mtp` function. Neither the stock 4.14
+nor the dieD 4.19 kernel has `CONFIG_USB_F_MTP`, but both have
+`CONFIG_USB_CONFIGFS_F_FS`, and AERA's MTP server already prefers
+`/dev/usb-ffs/mtp/ep0` over `/dev/mtp_usb`. `init.recovery.usb.rc` therefore
+mounts a `functionfs` instance named `mtp`, links `ffs.mtp` into
+`configs/b.1/f1`, and advertises the Xiaomi VID/PID `0x2717`/`0xff48`. No kernel
+change was needed; the 4.14 idea was a dead end.
+
+**exFAT** was the opposite: the kernel driver works and the userspace one does
+not. `exfat-fuse` mounts and lists directories, but every read returns zero
+bytes on this kernel (`head -c 64 | wc -c` → 33, `dd` → 0 bytes), so Windows
+MTP copies of card files failed with `0x80040005`. `CONFIG_EXFAT_FS` is built
+into the dieD kernel, and `mount -t exfat` reads and writes correctly, so the
+tree sets `TW_NO_EXFAT_FUSE := true` and `partition.cpp` calls `mount(2)`
+directly. Note that `AERA_INCLUDE_FUSE_EXFAT` is a **no-op** — nothing in the
+AERA 16 recovery tree reads it; `TW_NO_EXFAT_FUSE` is the real switch.
 
 ### Known limitations
 
-- **MTP is unavailable.** The kernel is built without
-  `CONFIG_USB_CONFIGFS_F_MTP`. Use *Mount → USB Storage* instead.
+- **Do not re-enable `exfat-fuse`.** It silently returns zero bytes for every
+  read on this kernel, which breaks MTP copies and zip installs from the card.
+  The build must keep `TW_NO_EXFAT_FUSE := true`.
+- **Mobile data does not work in recovery.** The `ccmni*` interfaces exist, but
+  there is no RIL, netd or telephony stack to dial them. WiFi is the only
+  network path.
 - **The UI is rasterised at 1440×3200 and downscaled to 1080×2400** — ~1.8× more
   pixels than the screen has. That is an AERA-side constant, not a driver issue.
 - **`aera backup --parts` needs TWRP-style mount points**: `--parts boot` fails

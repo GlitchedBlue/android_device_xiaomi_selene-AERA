@@ -441,28 +441,64 @@ media-failure symptom second.** Confirm the device still exists in
 Internal `/sdcard` (`/dev/block/dm-7`, f2fs) is unaffected and is a safe backup
 target meanwhile.
 
-## MTP cannot work on this kernel (use USB mass storage instead)
+## MTP works, and it never needed the kernel `f_mtp` function
 
-`E:[MTP] could not open MTP driver, errno: 2` is not a recovery bug. The kernel
-was built without `CONFIG_USB_CONFIGFS_F_MTP`, so the function never exists:
+`E:[MTP] could not open MTP driver, errno: 2` looked like a missing kernel
+function. It is not, and the 4.14 kernel would not have helped: both the stock
+4.14 and dieD 4.19 configs embedded in the kernels have **no**
+`CONFIG_USB_F_MTP` / `CONFIG_USB_CONFIGFS_F_MTP`, and both do have
+`CONFIG_USB_CONFIGFS_F_FS=y`.
 
 ```
 $ ls /config/usb_gadget/g1/functions/
 ffs.adb  ffs.fastboot  mass_storage.usb0        # no mtp.gs0
 $ ls /dev/mtp_usb                               # No such file
-$ getprop sys.usb.config                        # mtp,adb  (set, but hollow)
 ```
 
-`/init.recovery.usb.rc` does `mkdir /config/usb_gadget/g1/functions/mtp.gs0` and
-symlinks it to `configs/b.1/f1`; both fail silently because the kernel does not
-implement the function. `sys.usb.config=mtp,adb` and `sys.usb.ffs.mtp.ready=1`
-are therefore set with nothing behind them. This is a **kernel config** issue
-and cannot be fixed from the device tree.
+AERA's MTP server (`mtp/ffs/mtp_MtpServer.cpp`) already prefers FunctionFS:
+it opens `/dev/usb-ffs/mtp/ep0` first and only falls back to `/dev/mtp_usb`.
+So the fix is wiring, not kernel work. `init.recovery.usb.rc` now:
 
-**Workaround: USB mass storage.** `mass_storage.usb0` *is* supported (the
-function directory exists and `TARGET_USE_CUSTOM_LUN_FILE_PATH` already points
-at `.../mass_storage.usb0/lun.%d/file`), so "Mount -> USB Storage" exposes
-`/sdcard` as an ordinary USB drive. Use that instead of MTP for pulling files.
+- mounts a `functionfs` instance named `mtp` at `/dev/usb-ffs/mtp`;
+- creates `configs/b.1/f1` and links it to `ffs.mtp`;
+- advertises Xiaomi `0x2717`/`0xff40` and `0x2717`/`0xff48`.
+
+Verified on the device: `ep0`-`ep3` present, MUSB enabled `ep1in/ep1out`,
+`ep2in/ep2out`, `ep3in`, `USB_STATE=CONFIGURED`, `[MTP] created new mtpserver
+object`, storages 65537 `/sdcard1` and 65539 `/data/media/0`. Windows sees
+`USB\VID_2717&PID_FF48` as WPD device "Redmi 10" with *Internal Storage* and
+*MicroSD*, and a 25-byte file written from Explorer appeared in
+`/data/media/0/mtp_test.txt` with matching content.
+
+USB mass storage (`mass_storage.usb0`) still works and is the fallback if the
+host's MTP stack misbehaves.
+
+## exFAT must use the kernel driver (exfat-fuse returns zero bytes)
+
+Symptom: MTP copy from the MicroSD failed in Windows with `0x80040005` even
+though directories listed fine.
+
+```
+$ mount | grep sdcard1
+/dev/block/mmcblk1p1 on /sdcard1 type fuseblk (...)
+$ head -c 64 /sdcard1/Id.pdf | wc -c      # 33, not 64
+$ dd if=/sdcard1/Id.pdf of=/dev/null bs=512 count=1   # 0 bytes copied
+```
+
+`exfat-fuse` mounts and lists, but reads nothing. The kernel has
+`CONFIG_EXFAT_FS` (`/proc/filesystems` lists `exfat`), and remounting the same
+partition with `-t exfat` works: 2 257 935 bytes at 12 MB/s, plus a write/read
+round trip. After that, the same `Id.pdf` (557 373 B) copied over MTP from the
+card without error.
+
+The build now sets `TW_NO_EXFAT_FUSE := true`, which `Android.mk` turns into
+`-DTW_NO_EXFAT_FUSE` and `partition.cpp` uses to skip the fuse mount and call
+`mount(2)` with `"exfat"` (falling back to `vfat`). `AERA_INCLUDE_FUSE_EXFAT`
+is a **no-op** in this tree — do not rely on it.
+
+Note the `EIO` lesson above still applies: if `/sdcard1` returns `EIO` rather
+than zero bytes, check `/proc/partitions` for `mmcblk1` before suspecting the
+card.
 
 ## Verified working on the device
 
@@ -475,7 +511,7 @@ following was exercised on the phone, not inferred:
 | `/data` decryption | PIN screen accepted, `/sdcard` browsable |
 | Backup | `/sdcard1/AERA/BACKUPS/55ec505f0603/AERA-2026-11-14-12-56-14/boot.emmc.win` (64 MB) + `.sha2` + `recovery.log` |
 | Zip flash | `aera flash /sdcard/aera_flash_test.zip` -> `{"code":0}`; the zip's own marker printed `data_mounted=1`, `boot_hal=running`, `AERA FLASH TEST: success` |
-| MicroSD | `mmcblk1`, 58.3 GiB, exFAT via `exfat-fuse`, ~20 GB free |
+| MicroSD | `mmcblk1`, 58.3 GiB, exFAT via the **kernel** driver (`TW_NO_EXFAT_FUSE`), ~20 GB free |
 | Boot HAL | `init.svc.boot-hal-1-2=running`, `/sbin/libaera_boot_trim.so` present, shell `LD_PRELOAD` unset, logcat `Using HIDL version 1.2 of IBootControl` |
 
 ### The offline boot-image repack (how the two fixes reached the phone without a build)
