@@ -314,6 +314,9 @@ fastboot flash boot_a boot.img     # slot _a; use boot_b on the other slot
 fastboot reboot
 ```
 
+The image is dual-boot, so `fastboot reboot` brings up the installed ROM. For
+AERA, `adb reboot recovery`, or hold **Volume Up** while powering on.
+
 AVB is **not** enforced on this bootloader (`verifiedbootstate=orange`,
 `veritymode=disabled`), so the image does not need re-signing. The stock boot
 image is a valid rollback: `fastboot flash boot_a <stock-boot>.img`.

@@ -3,6 +3,10 @@ _src/
 out/
 *.zip
 
+# Joined from Image.gz.00 + Image.gz.01 by prebuilt/assemble-kernel.sh. The
+# parts are tracked; the 12.4 MB result is over the GitHub blob size limit.
+device/xiaomi/selene/prebuilt/Image.gz
+
 # Editor/OS noise
 .DS_Store
 Thumbs.db
