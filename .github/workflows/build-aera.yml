@@ -246,25 +246,63 @@ jobs:
       # all** -- while this step was green. Soong's analysis then ran with half
       # the swap it was tuned for, and 45 minutes into Build the box stopped
       # answering. Never let the swap layout be a guess again.
+      #
+      # The 20261111 runner image now ships zram0 already active (3 GB), which
+      # made the old "size zram0" line fail with EBUSY and killed run
+      # 44141489469 four minutes in, before it built anything. Take a device
+      # that is not already swap, and hot_add one if they are all taken.
       - name: Add compressed RAM swap
         run: |
           set -euo pipefail
-          if ! sudo modprobe zram num_devices=1 2>/dev/null; then
-            echo "::error::modprobe zram failed - no compressed swap on this image"
+          sudo modprobe zram 2>/dev/null || true
+          if [ ! -e /sys/block/zram0 ]; then
+            echo "::error::no zram device - modprobe zram failed"
             exit 1
           fi
+
+          active=$(swapon --noheadings --show=NAME 2>/dev/null || true)
+          echo "already swap: ${active:-none}"
+
+          pick=""
+          idx=""
+          for n in 0 1 2 3 4 5 6 7; do
+            dev="/dev/zram${n}"
+            if [ ! -e "${dev}" ]; then
+              # hot_add creates the next device and prints its index.
+              [ -e /sys/class/zram-control/hot_add ] || continue
+              sudo sh -c 'cat /sys/class/zram-control/hot_add' >/dev/null 2>&1 || true
+              [ -e "${dev}" ] || continue
+            fi
+            # Skip anything already carrying swap, or already sized.
+            if printf '%s\n' "${active}" | grep -qx "${dev}"; then
+              continue
+            fi
+            if [ "$(sudo cat /sys/block/zram${n}/disksize 2>/dev/null || echo 0)" != "0" ]; then
+              continue
+            fi
+            pick="${dev}"
+            idx="${n}"
+            break
+          done
+
+          if [ -z "${pick}" ]; then
+            echo "::error::no free zram device (already swap: ${active:-none})"
+            exit 1
+          fi
+          echo "using ${pick} for compressed swap"
+
           for alg in lz4 zstd; do
-            if echo "${alg}" | sudo tee /sys/block/zram0/comp_algorithm >/dev/null 2>&1; then
+            if echo "${alg}" | sudo tee /sys/block/zram${idx}/comp_algorithm >/dev/null 2>&1; then
               echo "zram compression: ${alg}"
               break
             fi
           done
-          if ! echo 24G | sudo tee /sys/block/zram0/disksize >/dev/null; then
-            echo "::error::could not size zram0 (already in use?)"
+          if ! echo 24G | sudo tee /sys/block/zram${idx}/disksize >/dev/null; then
+            echo "::error::could not size ${pick}"
             exit 1
           fi
-          sudo mkswap /dev/zram0 >/dev/null
-          sudo swapon --priority 100 /dev/zram0
+          sudo mkswap "${pick}" >/dev/null
+          sudo swapon --priority 100 "${pick}"
           sudo sysctl -w vm.swappiness=100 >/dev/null
           echo "--- swap devices (zram first) ---"
           swapon --show
