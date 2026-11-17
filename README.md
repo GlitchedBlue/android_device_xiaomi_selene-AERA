@@ -9,7 +9,7 @@ Device      Xiaomi Redmi 10 (selene)
 SoC         MediaTek MT6768 / Helio G88
 CPU         arm64, 2x Cortex-A75 + 6x Cortex-A55
 Display     1080 x 2400, 440 dpi, fbdev (no DRM)
-Kernel      4.14 (prebuilt, from the stock selene boot image)
+Kernel      4.19.325 (dieD prebuilt; the stock 4.14 cannot run this userspace)
 Slots       A/B + virtual A/B
 Partitions  dynamic (super: system, vendor, product)
 Recovery    recovery-as-boot (no recovery partition; flash boot.img)
@@ -361,7 +361,8 @@ device/xiaomi/selene/
 ├── vendorsetup.sh          # AERA build environment
 ├── bootctl_compat/         # the libbase Trim shim
 ├── gralloc1_compat/        # gralloc1-on-mali_gralloc shim + gralloc1-probe
-├── prebuilt/               # Image.gz, dtb.img, dtbo.img
+├── prebuilt/               # Image.gz (shipped split as .00/.01), dtb.img,
+│                           # dtbo.img, assemble-kernel.sh
 └── recovery/root/          # fstab, twrp.flags, MTK init/HALs, vintf,
                             # scoped boot-HAL .rc, GPU staging scripts
 ```

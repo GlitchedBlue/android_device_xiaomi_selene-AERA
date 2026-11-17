@@ -88,7 +88,7 @@ Use `mka clean` (or delete `out/target/product/selene`) after changing
 | Symptom | Fix |
 | --- | --- |
 | `Unable to find product twrp_selene` | Device tree is not at `device/xiaomi/selene`, or `AndroidProducts.mk` was not picked up. Re-run `source build/envsetup.sh`. |
-| Missing `Image.gz` / `dtb.img` | The `prebuilt/` folder is empty. Re-copy the tree or pull the files from the PBRP selene repo. |
+| Missing `Image.gz` / `dtb.img` | The `prebuilt/` folder is empty. Re-copy the tree, or run `prebuilt/assemble-kernel.sh` to join the tracked `Image.gz.00`/`.01` parts. |
 | `BOARD_KERNEL_SEPARATED_DTBO` errors | Ensure `prebuilt/dtbo.img` exists and `BOARD_PREBUILT_DTBOIMAGE` points at it. |
 | Out of memory / `ninja` killed | Lower `-j` (e.g. `-j4`) and add swap. |
 | `repo: command not found` | Install the `repo` launcher (see the AOSP docs) or `apt install repo`. |

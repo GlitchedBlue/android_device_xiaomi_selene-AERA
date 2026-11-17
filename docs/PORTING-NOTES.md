@@ -36,11 +36,11 @@ The tree combines two sources:
 
 ## Known risks / TODOs
 
-1. **Not compiled yet.** The tree has never been through an AERA build. Expect
-   missing-package or flag-name fixes on the first run.
-2. **Kernel age.** AERA targets modern kernels. The selene prebuilt is a 4.14
-   MTK kernel. Core recovery should boot, but AERA's browser/plugin sandbox
-   (which relies on newer kernel features) probably will not.
+1. **Build.** The tree now builds and boots on GitHub Actions (see the README
+   status table); these notes are kept as the record of what the first runs hit.
+2. **Kernel age.** AERA targets modern kernels. The selene prebuilt is now dieD's
+   4.19.325 MTK kernel, which is what runs this userspace and gives the device
+   GPU acceleration and WiFi; the stock 4.14 prebuilt had neither.
 3. **MTK HAL packages.** The PBRP tree references packages such as
    `android.hardware.boot@1.2-mtkimpl`, `bootctrl.mt6768.recovery`, and
    `libhealthd.mt6768`. Those come from a MediaTek device tree that AERA does
