@@ -48,8 +48,8 @@ jobs:
 
       - name: Clone the 4.14.357 selene tree
         run: |
-          git clone --depth=1 -b kernel-tree \
-            https://github.com/Jbub5/android_kernel_xiaomi_mt6768.git \
+          git clone --depth=1 -b LittleSpammyMailman-legacy \
+            https://github.com/SabriErenAydogan/android_kernel_xiaomi_mt6768.git \
             "$RUNNER_TEMP/kernel"
 
       - name: Select the r32p1 DDK
