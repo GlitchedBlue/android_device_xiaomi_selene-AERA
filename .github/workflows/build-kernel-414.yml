@@ -52,6 +52,23 @@ jobs:
             https://github.com/SabriErenAydogan/android_kernel_xiaomi_mt6768.git \
             "$RUNNER_TEMP/kernel"
 
+      - name: Set up KernelSU-Next
+        working-directory: ${{ runner.temp }}/kernel
+        run: |
+          # drivers/Kconfig in this tree already has
+          #   source "drivers/kernelsu/Kconfig"
+          # but drivers/kernelsu is not in the repository: it is a symlink that
+          # the KernelSU-Next setup script creates. Without it, `make
+          # selene_defconfig` dies with:
+          #   drivers/Kconfig:224: can't open file "drivers/kernelsu/Kconfig"
+          curl -LSs -o "$RUNNER_TEMP/ksu-setup.sh" \
+            https://raw.githubusercontent.com/MrShockWAVEog/KernelSU-Next/shockwave/kernel/setup.sh
+          sh "$RUNNER_TEMP/ksu-setup.sh" shockwave
+          ls -ld drivers/kernelsu
+          test -f drivers/kernelsu/Kconfig || {
+            echo 'ERROR: drivers/kernelsu/Kconfig still missing'; exit 1; }
+          grep -n 'kernelsu' drivers/Makefile drivers/Kconfig
+
       - name: Select the r32p1 DDK
         working-directory: ${{ runner.temp }}/kernel
         run: |
