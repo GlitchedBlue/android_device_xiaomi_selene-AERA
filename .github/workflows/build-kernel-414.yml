@@ -1,0 +1,110 @@
+name: Build 4.14 kernel (selene)
+
+# Builds the one 4.14 tree that has both things AERA needs from a kernel:
+#
+#   * the WLAN driver in-tree (obj-$(CONFIG_MTK_COMBO_WIFI) += wlan/core/gen4m/)
+#     so wlan0 exists without any .ko matching the kernel's vermagic
+#   * mali_valhall/mali-r32p1, i.e. a kbase whose UK version (11.38) is >= the
+#     vendor userspace's (r32p1, 11.31), so libGLES_mali.so initialises
+#
+# The tree is 4.14.357 and ships selene_defconfig + selene.dts. Its defconfig
+# still selects "mali bifrost r25p0", which is the old DDK, so the only change
+# this workflow makes is CONFIG_MTK_GPU_VERSION -> "mali valhall r32p1".
+#
+# Artifact: Image.gz + selene.dtb. Pair them with AERA's ramdisk using
+# tools/repack-aera.py; the stock 4.14 boot image supplies the dtbo/dtb and the
+# load addresses (selene cannot fastboot boot, so it has to be flashed).
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bc bison build-essential curl flex g++-multilib \
+            gcc-multilib gcc-aarch64-linux-gnu git gnupg gperf imagemagick \
+            lib32ncurses-dev lib32readline-dev lib32z1-dev liblz4-tool libncurses6 \
+            libncurses-dev libsdl1.2-dev libssl-dev libwxgtk3.2-dev libxml2 \
+            libxml2-utils lzop pngcrush rsync schedtool squashfs-tools xsltproc \
+            zip zlib1g-dev device-tree-compiler
+
+      - name: Download clang
+        run: |
+          mkdir -p "$RUNNER_TEMP/toolchain"
+          cd "$RUNNER_TEMP/toolchain"
+          curl -L --retry 5 -o clang.tar.gz \
+            https://github.com/ZyCromerZ/Clang/releases/download/21.0.0git-20250415-release/Clang-21.0.0git-20250415.tar.gz
+          tar -xzf clang.tar.gz
+          rm clang.tar.gz
+          if [ "$(find . -mindepth 1 -maxdepth 1 -type d | wc -l)" = "1" ]; then
+            mv "$(find . -mindepth 1 -maxdepth 1 -type d)"/* .
+          fi
+          "$PWD/bin/clang" --version
+
+      - name: Clone the 4.14.357 selene tree
+        run: |
+          git clone --depth=1 -b kernel-tree \
+            https://github.com/Jbub5/android_kernel_xiaomi_mt6768.git \
+            "$RUNNER_TEMP/kernel"
+
+      - name: Select the r32p1 DDK
+        working-directory: ${{ runner.temp }}/kernel
+        run: |
+          grep -n 'MTK_GPU_VERSION\|MTK_GPU_SUPPORT' arch/arm64/configs/selene_defconfig
+          sed -i 's|^CONFIG_MTK_GPU_VERSION=.*|CONFIG_MTK_GPU_VERSION="mali valhall r32p1"|' \
+            arch/arm64/configs/selene_defconfig
+          grep -q '^CONFIG_MTK_GPU_SUPPORT=y' arch/arm64/configs/selene_defconfig ||
+            echo 'CONFIG_MTK_GPU_SUPPORT=y' >> arch/arm64/configs/selene_defconfig
+          echo '--- after'
+          grep -n 'MTK_GPU_VERSION\|MTK_GPU_SUPPORT' arch/arm64/configs/selene_defconfig
+
+      - name: Build Image.gz and dtbs
+        working-directory: ${{ runner.temp }}/kernel
+        run: |
+          export PATH="$RUNNER_TEMP/toolchain/bin:$PATH"
+          export KBUILD_BUILD_HOST=github-actions
+          export KBUILD_BUILD_USER=aera
+          FLAGS="ARCH=arm64 O=out CC=clang LLVM=1 LLVM_IAS=1 \
+            LD=ld.lld AS=llvm-as AR=llvm-ar NM=llvm-nm \
+            OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump READELF=llvm-readelf \
+            STRIP=llvm-strip CROSS_COMPILE=aarch64-linux-gnu- \
+            CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
+            CROSS_COMPILE_COMPAT=arm-linux-gnueabi-"
+          make -j"$(nproc)" $FLAGS selene_defconfig
+          grep -E 'CONFIG_MTK_GPU_VERSION|CONFIG_MTK_GPU_SUPPORT|CONFIG_MTK_COMBO_WIFI' out/.config
+          make -j"$(nproc)" $FLAGS Image.gz
+          make -j"$(nproc)" $FLAGS dtbs || true
+
+      - name: Verify the two capabilities
+        working-directory: ${{ runner.temp }}/kernel
+        run: |
+          set -e
+          ls -l out/arch/arm64/boot/Image.gz
+          md5sum out/arch/arm64/boot/Image.gz
+          # GPU: the DDK version string is compiled into vmlinux
+          echo '--- DDK:'
+          strings out/vmlinux | grep -E 'r[0-9]+p[0-9]+-[0-9a-f]+ \(UK version [0-9.]+\)' | sort -u || true
+          strings out/vmlinux | grep -q 'UK version 11\.3' || {
+            echo 'ERROR: expected a UK 11.3x DDK in vmlinux'; exit 1; }
+          # WiFi: gen4m is linked in, not a module
+          echo '--- WLAN symbols:'
+          nm out/vmlinux | grep -ci 'wlan' || true
+          test "$(nm out/vmlinux | grep -ci 'wlan')" -gt 100 || {
+            echo 'ERROR: WLAN does not look linked into vmlinux'; exit 1; }
+          echo '--- dtbs:'
+          find out/arch/arm64/boot/dts -name '*.dtb' | head -20
+
+      - name: Upload kernel
+        uses: actions/upload-artifact@v4
+        with:
+          name: selene-4.14.357-r32p1
+          path: |
+            ${{ runner.temp }}/kernel/out/arch/arm64/boot/Image.gz
+            ${{ runner.temp }}/kernel/out/vmlinux
+          if-no-files-found: error
+          retention-days: 14
