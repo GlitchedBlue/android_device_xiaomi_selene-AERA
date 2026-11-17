@@ -135,7 +135,7 @@ two kernels, not from documentation:
 | MTP | `CONFIG_USB_CONFIGFS_F_FS=y` | same |
 | exFAT SD | `CONFIG_EXFAT_FS=y` | same |
 | Screenshots | yes (software canvas is drawn) | yes |
-| **GPU** | **no** — Mali DDK `r26p0` (UK 11.27) vs userspace `r32p1` (UK 11.31); the DDK version check fails | yes (UK 11.46) |
+| **GPU** | **no** — Mali DDK `r26p0` (UK 11.27) vs userspace `r32p1` (UK 11.31); the DDK version check fails | yes (`r32p1`, UK 11.38) |
 | **WiFi** | **no** — no `CONFIG_WLAN_DRV_BUILD_IN`; the WLAN driver is a module and this ROM ships no `.ko` files at all | yes (built in) |
 
 So a 4.14 user gets MTP, exFAT and screenshots, but software rendering and no
@@ -145,6 +145,10 @@ WiFi. Getting both on 4.14 means rebuilding the kernel with
 config change. There is no userspace shortcut: the only Mali userspace on the
 device is r32p1, and the gralloc1 shim is written against MediaTek's r32p1
 gralloc.
+
+The exact evidence — kernel IDs, the embedded config lines, the DDK version
+strings, and the questions a 4.14 tree owner would need to answer — is in
+[`docs/KERNEL-4.14.md`](docs/KERNEL-4.14.md).
 
 The vendor is not the variable. The GPU path uses the **stock vendor's own
 files**, byte for byte (`libGLES_mali.so` and `hwcomposer.mt6768.so` have the
