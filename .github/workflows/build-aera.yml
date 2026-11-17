@@ -590,6 +590,17 @@ jobs:
       # ---------------------------------------------------------------------
       # Build
       # ---------------------------------------------------------------------
+      # The dieD 4.19 kernel prebuilt is 12384187 bytes, over the 8 MB ceiling
+      # the GitHub contents/blob API enforces per file, so the device tree
+      # stores it as Image.gz.00 + Image.gz.01 and joins it here. Doing it as a
+      # separate step means a corrupt part fails in seconds instead of after
+      # the build, and the size/md5 check is in the script itself.
+      - name: Assemble kernel prebuilt
+        run: |
+          cd "${WORKDIR}/${DEVICE_PATH}"
+          ls -l prebuilt/
+          ./prebuilt/assemble-kernel.sh
+
       # GOGC/GOMEMLIMIT/GOMAXPROCS bound Soong's Go heap.
       #
       # 40 / 11GiB / 2 is the combination from run #7, the only build that has

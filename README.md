@@ -25,7 +25,7 @@ This tree **builds, boots and works**. It is a bring-up port, not a release.
 | --- | --- |
 | Device tree structure | Done |
 | BoardConfig / product makefiles | Done |
-| Kernel / DTB / DTBO prebuilts | From the PBRP selene tree |
+| Kernel / DTB / DTBO prebuilts | dieD 4.19.325 (GPU + WiFi capable) — see *Kernel and vendor: what is actually required* |
 | MTK recovery HALs (keymaster, gatekeeper, TEE) | From the PBRP selene tree |
 | Compile | **Works** — GitHub Actions, run #3 onward |
 | Boot / UI / touch | **Works** |
@@ -34,6 +34,9 @@ This tree **builds, boots and works**. It is a bring-up port, not a release.
 | GPU acceleration | **Works** — run `43961488385` (`ca912c22`); the Mali backend composites the AERA UI on the device (see below) |
 | MTP | **Works** — FunctionFS (`ffs.mtp`), no kernel `f_mtp` needed |
 | exFAT MicroSD | **Works** — kernel `exfat` driver; `exfat-fuse` is broken on this kernel |
+| WiFi | **Works** — MTK connsys bring-up + AERA's own `wpa_supplicant` (`9040fb34`); scans and returns APs |
+| Screenshots | **Works** — captured from the HWC2 client target, not the never-drawn software canvas (`ed66222e`) |
+| Dual boot | **Works** — the release `boot.img` boots the system normally and AERA on `adb reboot recovery` |
 
 ### Verified on the device
 
@@ -75,6 +78,131 @@ into the dieD kernel, and `mount -t exfat` reads and writes correctly, so the
 tree sets `TW_NO_EXFAT_FUSE := true` and `partition.cpp` calls `mount(2)`
 directly. Note that `AERA_INCLUDE_FUSE_EXFAT` is a **no-op** — nothing in the
 AERA 16 recovery tree reads it; `TW_NO_EXFAT_FUSE` is the real switch.
+
+### WiFi
+
+WiFi is the MediaTek connsys combo, and the kernel already has it: the dieD
+4.19 kernel sets `CONFIG_MTK_COMBO_WIFI=y` and `CONFIG_WLAN_DRV_BUILD_IN=y`, the
+platform device `18000000.wifi` is in the DTB, and the driver binds as soon as
+the connectivity SoC is powered. What was missing was the userspace power
+sequence, which nothing in recovery runs:
+
+```
+wmt_loader     powers the connectivity SoC, creates /dev/stpwmt
+wmt_launcher   downloads the ROM patch, runs calibration, keeps STP alive
+/dev/wmtWifi   writing 1 makes the WLAN driver register wlan0
+```
+
+`system/bin/aera-wlan-up.sh` runs that once at boot as a background oneshot, so
+a tap on *Start WLAN* only has to do `ifconfig wlan0 up` and start
+`wpa_supplicant` inside `wlan.cpp`'s 20 s window.
+
+Three defects, each of which failed silently:
+
+1. **Missing connsys firmware.** The ramdisk only had the WIFI and patch-MCU
+   blobs. Without `soc1_0_ram_bt_1a_1_hdr.bin` and
+   `soc1_0_ram_mcu_1a_1_hdr.bin` (and `BT_FW.cfg` / `wifi.cfg`, which the
+   launcher reads next to them) the patch download never completes: the SoC
+   stays at `CPUPCR 0x00000000` and every STP receive times out. All four are
+   copied from the stock vendor's `/firmware`, unmodified.
+2. **Wrong readiness signal.** `vendor.connsys.driver.ready` is already `yes` at
+   boot, so powering WLAN on at that point injects a WMT command into the STP
+   stream `wmt_launcher` is still using. The core asserts
+   (`wmt_core_trigger_assert: Send Assert command !`) and every later
+   `WIFI_write` fails with `WMT turn on WIFI fail!` until reboot. The script
+   waits for the launcher's own `Calibration end` line in dmesg instead.
+3. **`wpa_supplicant` pointed at a file that does not exist.** The service used
+   `/vendor/bin/hw/wpa_supplicant`; AERA builds its own into `/system/bin`.
+   `wlan.cpp` waits for `/tmp/recovery/sockets/wlan0` and a PING/PONG, which is
+   exactly where `ctrl_interface=wlan0` puts the socket once `-O` points there.
+
+Verified on the device: `wlan0` UP, `wpa_cli ping` → `PONG`, scan returns APs,
+DHCP lease, `ping 8.8.8.8`, DNS resolution and an HTTP fetch through a phone
+hotspot. 5 GHz is supported (25 channels advertised). WPA3/SAE is untested and
+not in the driver's advertised `key_mgmt` list, so WPA3-only networks may fail;
+WPA2-PSK works. Mobile data does not: there is no RIL/netd/telephony stack in
+recovery, so the `ccmni*` interfaces cannot be dialled.
+
+### Kernel and vendor: what is actually required
+
+AERA itself is kernel-agnostic and boots on both kernels selene has. What
+differs is three kernel capabilities. Measured from the configs embedded in the
+two kernels, not from documentation:
+
+| | 4.14.186 (PBRP prebuilt) | 4.19.325 (dieD) |
+| --- | --- | --- |
+| AERA boots | yes | yes |
+| MTP | `CONFIG_USB_CONFIGFS_F_FS=y` | same |
+| exFAT SD | `CONFIG_EXFAT_FS=y` | same |
+| Screenshots | yes (software canvas is drawn) | yes |
+| **GPU** | **no** — Mali DDK `r26p0` (UK 11.27) vs userspace `r32p1` (UK 11.31); the DDK version check fails | yes (UK 11.46) |
+| **WiFi** | **no** — no `CONFIG_WLAN_DRV_BUILD_IN`; the WLAN driver is a module and this ROM ships no `.ko` files at all | yes (built in) |
+
+So a 4.14 user gets MTP, exFAT and screenshots, but software rendering and no
+WiFi. Getting both on 4.14 means rebuilding the kernel with
+`CONFIG_WLAN_DRV_BUILD_IN=y` **and** a Mali kbase whose UK version is at least
+11.31 — the 4.14 source carries r26p0, so that part is a kbase backport, not a
+config change. There is no userspace shortcut: the only Mali userspace on the
+device is r32p1, and the gralloc1 shim is written against MediaTek's r32p1
+gralloc.
+
+The vendor is not the variable. The GPU path uses the **stock vendor's own
+files**, byte for byte (`libGLES_mali.so` and `hwcomposer.mt6768.so` have the
+same md5 in `/vendor` and in the staged blob store), and the WLAN firmware comes
+from that vendor's `/firmware`. Nothing in the vendor is patched or replaced.
+The one non-stock file is `gralloc.mt6768.so`, which the vendor does not ship at
+all — selene's Android 13 vendor has only `gralloc.default.so` — and it is the
+gralloc1 shim, which `dlsym`s MediaTek's exported allocator out of the stock
+library. The libs are staged on the `rescue` partition so they are available
+before `/vendor` is mounted; if the real `/vendor` is up early it is bound
+instead.
+
+### Dual boot: AERA and the system from one image
+
+The release image is built this way by default, so it can be flashed as a
+drop-in replacement for the stock boot image: boot normally and the ROM comes up,
+ask for recovery and AERA does.
+
+One boot image holds both. `boot_a` carries the system's kernel and a hybrid
+ramdisk: AERA's recovery ramdisk at the root, and the system's
+`/first_stage_ramdisk` (fstab plus `e2fsck`) alongside it.
+
+The handoff is stock AOSP behaviour, not a patch. When the bootloader is **not**
+asking for recovery, init bind-mounts `/first_stage_ramdisk` over `/`, mounts
+the real `/system` from there, and execs the system's own `/system/bin/init`
+second stage — so the ROM runs with its own init, its own rc files and its own
+properties. When the bootloader *is* asking for recovery (`androidboot.mode=recovery`,
+set by `adb reboot recovery` or the key combo), no bind mount happens and AERA
+runs from the ramdisk root as usual.
+
+Two things decide whether this works, and both cost a bootloop to learn:
+
+1. **The first-stage fstab must be the system's, not AERA's.** AERA's fstab is a
+   recovery fstab: `avb=vbmeta_system`, `avb_keys=/avb/q-g`, ext4 only. The
+   system's is hand-tuned for selene — erofs first, ext4 second, no AVB — which
+   is what lets first-stage fs_mgr mount HyperOS (erofs) and MIUI (ext4) alike.
+2. **A boot v2 header stores no DTB offset.** The DTB always follows the second
+   stage and the recovery DTBO, each page aligned. Deriving it from
+   `recovery_dtbo_offset` is wrong whenever that field is 0 — which it is for the
+   system's image, since it has no recovery DTBO. The result is the boot header
+   itself (magic `414e4452`, "ANDR") written into the DTB slot, and then nothing
+   boots at all: no system, no recovery, just a loop. Assert the DTB magic
+   (`d00dfeed`) when repacking.
+
+Sizes are the other constraint. AERA's ramdisk compresses to ~53.4 MB and the
+system's to ~38 MB, so the merged image is 63.15 MiB of the 64 MiB partition —
+it fits, but a merged AERA + OrangeFox ramdisk does not.
+
+Verified on the device: normal boot reaches `sys.boot_completed=1` on the ROM,
+and `adb reboot recovery` comes up with `ro.boot.mode=recovery` and
+`init.svc.recovery=running`. AERA keeps its GPU stack, exFAT SD, MTP and WLAN in
+the hybrid.
+
+One diagnostic that does **not** work on this kernel: pstore. The ramoops
+console region is full (262132 of 262144 bytes) and this kernel's ramoops has no
+erase support, so `rm /sys/fs/pstore/*` only removes the entries — the region is
+never zeroed and the same old record is re-exported on every boot. A failed boot
+leaves no new log there. Reproduce failures by eye, or add your own logging.
 
 ### Known limitations
 
@@ -169,6 +297,13 @@ lunch twrp_selene-bp2a-eng
 mka adbd bootimage -j$(nproc --all)
 ```
 
+One thing to do first: the kernel prebuilt ships split (see *Dual boot*), so join
+it once before the first build. The script checks the size and md5.
+
+```bash
+device/xiaomi/selene/prebuilt/assemble-kernel.sh
+```
+
 `twrp_selene` is the product name inherited from the reference tree; the UI is
 AERA. See [`docs/BUILDING.md`](docs/BUILDING.md).
 
@@ -242,6 +377,10 @@ device/xiaomi/selene/
   ~12 min saved per attempt) and the `GOGC` / `GOMEMLIMIT` / `GOMAXPROCS` values
   used here — the same manifest on the same runner class.
 - PitchBlackRecoveryProject — selene hardware tree (kernel, HALs, fstab, init)
+- [dieD](https://github.com/dieD) — the 4.19.325 kernel prebuilt. It is the only
+  selene kernel with `CONFIG_WLAN_DRV_BUILD_IN` and a Mali DDK new enough for
+  the stock r32p1 userspace, so it is what makes both WiFi and GPU acceleration
+  possible, and it boots the stock system unchanged.
 - TeamWin / OrangeFox / LineageOS — upstream recovery work
 
 Current status, evidence and the full list of things learned the hard way are

@@ -52,16 +52,23 @@ TARGET_OTA_ASSERT_DEVICE := selene,selenes
 TARGET_SCREEN_DENSITY := 440
 
 # ---------------------------------------------------------------------------
-# Kernel (prebuilt, extracted from the working selene boot image)
+# Kernel (prebuilt: dieD 4.19.325, the kernel selene actually runs)
+#
+# The stock MIUI 4.14 kernel cannot run this userspace: it has no
+# CONFIG_WLAN_DRV_BUILD_IN and ships Mali r26p0 against r32p1 userspace, so the
+# image it produced had neither WiFi nor GPU acceleration. dieD's 4.19 build has
+# both, boots the stock system, and is what the verified images use. The load
+# addresses below are the ones in that kernel's boot image; do not change them
+# without re-checking the resulting image.
 # ---------------------------------------------------------------------------
 BOARD_BOOT_HEADER_VERSION := 2
 # Kept for the TWRP/AERA boot-image tooling that still reads this name.
 BOARD_BOOTIMG_HEADER_VERSION := 2
-BOARD_KERNEL_BASE := 0x40078000
+BOARD_KERNEL_BASE := 0x40080000
 BOARD_KERNEL_CMDLINE := bootopt=64S3,32N2,64N2
 BOARD_KERNEL_PAGESIZE := 2048
-BOARD_RAMDISK_OFFSET := 0x07c08000
-BOARD_KERNEL_TAGS_OFFSET := 0x0bc08000
+BOARD_RAMDISK_OFFSET := 0x07c00000
+BOARD_KERNEL_TAGS_OFFSET := 0x0bc00000
 BOARD_KERNEL_IMAGE_NAME := Image.gz
 TARGET_PREBUILT_KERNEL := $(DEVICE_PATH)/prebuilt/Image.gz
 TARGET_PREBUILT_DTB := $(DEVICE_PATH)/prebuilt/dtb.img
