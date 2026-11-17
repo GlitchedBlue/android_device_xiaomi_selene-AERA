@@ -22,22 +22,13 @@
 # supplicant start are left.
 
 on boot
-    start aera-wmt-loader
-    start aera-wmt-launcher
     start aera-wlan-boot
 
-service aera-wmt-loader /vendor/bin/wmt_loader
-    user root
-    group root system
-    oneshot
-    disabled
-    seclabel u:r:recovery:s0
-
-service aera-wmt-launcher /vendor/bin/wmt_launcher -p /vendor/firmware/ -o 1
-    user root
-    group root system
-    disabled
-    seclabel u:r:recovery:s0
+# One owner for the power sequence: aera-wlan-up.sh --boot runs wmt_loader,
+# starts wmt_launcher, waits for vendor.connsys.driver.ready, then powers the
+# WLAN function on. Do NOT also declare wmt_loader / wmt_launcher as separate
+# services here: that ran the launcher twice, and two daemons fighting over
+# /dev/stpwmt corrupt the STP stream the patch download uses.
 
 # Waits for the launcher to finish the patch download and calibration, then
 # powers on the WLAN function and waits for wlan0. All of it is best effort:

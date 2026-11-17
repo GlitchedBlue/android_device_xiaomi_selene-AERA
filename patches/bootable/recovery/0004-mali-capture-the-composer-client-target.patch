@@ -1,0 +1,102 @@
+--- a/minuitwrp/graphics_drm.cpp
++++ b/minuitwrp/graphics_drm.cpp
+@@ -1336,6 +1336,61 @@
+ 	return 0;
+ }
+ 
++// The Mali backend presents through HWC2, not through a DRM flip, so nothing
++// ever set presented_surface. gr_capture_source() then fell back to minui's
++// software canvas, which is never drawn while the GPU owns the UI: screenshots
++// came out as a valid PNG of pure black (7629 bytes at 1080x2400). Keep the
++// client target the composer just consumed, keyed by the caller's dma-buf fd,
++// and let gr_drm_get_presented_surface() map it on demand.
++extern "C" int gr_drm_note_presented_dmabuf(int dma_buf_fd, int width,
++                                            int height, int pitch,
++                                            uint32_t drm_format) {
++    static drm_surface* surfaces[2] = {nullptr, nullptr};
++    static int sources[2] = {-1, -1};
++    static int next_slot = 0;
++
++    if (dma_buf_fd < 0 || width <= 0 || height <= 0 || pitch <= 0)
++        return -EINVAL;
++
++    int slot = -1;
++    for (int i = 0; i < 2; ++i) {
++        if (sources[i] == dma_buf_fd) {
++            slot = i;
++            break;
++        }
++    }
++    if (slot < 0) {
++        slot = next_slot;
++        next_slot = (next_slot + 1) % 2;
++        if (surfaces[slot] != nullptr) {
++            drm_destroy_surface(surfaces[slot]);
++            surfaces[slot] = nullptr;
++        }
++        drm_surface* surface =
++            static_cast<drm_surface*>(calloc(1, sizeof(drm_surface)));
++        if (surface == nullptr) return -ENOMEM;
++        surface->dma_buf_fd = fcntl(dma_buf_fd, F_DUPFD_CLOEXEC, 0);
++        if (surface->dma_buf_fd < 0) {
++            free(surface);
++            return -errno;
++        }
++        surfaces[slot] = surface;
++        sources[slot] = dma_buf_fd;
++    }
++
++    drm_surface* surface = surfaces[slot];
++    surface->drm_format = drm_format;
++    surface->base.width = width;
++    surface->base.height = height;
++    surface->base.row_bytes = pitch;
++    surface->base.pixel_bytes = drm_format_to_bpp(drm_format) / 8;
++    surface->base.format = GGL_PIXEL_FORMAT_RGBA_8888;
++    surface->base.data = nullptr;
++    presented_surface = surface;
++    presented_buffer = -1;
++    return 0;
++}
++
+ gr_surface gr_drm_get_presented_surface(void) {
+ 	if (!presented_surface) return nullptr;
+ 	if (!presented_surface->base.data && presented_surface->dma_buf_fd >= 0) {
+--- a/aeraui/core/gpu_renderer.cpp
++++ b/aeraui/core/gpu_renderer.cpp
+@@ -447,6 +447,10 @@
+   return display;
+ }
+ 
++extern "C" int gr_drm_note_presented_dmabuf(int dma_buf_fd, int width,
++                                            int height, int pitch,
++                                            uint32_t drm_format);
++
+ bool GpuRenderer::Present(lv_display_t* display) {
+   if (!ready_ || display == nullptr)
+     return false;
+@@ -508,9 +512,21 @@
+     if (acquire_fence >= 0) close(acquire_fence);
+     return false;
+   }
+-  if (mali_display_ != nullptr ? !mali_display_->Present(index, acquire_fence)
+-                               : gr_drm_present(scanouts_[index]) != 0)
+-    return false;
++  if (mali_display_ != nullptr) {
++    if (!mali_display_->Present(index, acquire_fence)) return false;
++    // The composer consumes the client target itself, so no DRM flip follows
++    // and the screenshot writer has no presented surface to read. Hand it the
++    // buffer the composer just presented; without this every capture is a
++    // black PNG.
++    int dma_buf_fd = -1;
++    unsigned stride = 0;
++    if (mali_display_->DescribeBuffer(index, &dma_buf_fd, &stride))
++      gr_drm_note_presented_dmabuf(dma_buf_fd, width_, height_,
++                                   static_cast<int>(stride * 4U),
++                                   kDrmFormatAbgr8888);
++  } else if (gr_drm_present(scanouts_[index]) != 0) {
++    return false;
++  }
+ 
+   next_buffer_ = mali_display_ != nullptr ? (index + 1U) % buffer_count_ : 1U - index;
+   return true;
