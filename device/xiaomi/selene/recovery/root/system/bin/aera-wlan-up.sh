@@ -10,6 +10,16 @@
 #               there, bring it up and start wpa_supplicant
 #
 # The kernel side is already built in; this is only the vendor power sequence.
+#
+# Ordering matters and the failure mode is silent: writing 1 to /dev/wmtWifi
+# before the launcher has finished its ROM patch download injects a WMT command
+# into the STP stream the launcher is using. The core then asserts
+# (`wmt_core_trigger_assert: Send Assert command !`) and every later WIFI_write
+# fails with `WMT turn on WIFI fail!` until the next reboot. The old script
+# waited on vendor.connsys.driver.ready, which the driver sets long before the
+# patch download finishes -- it was already "yes" at boot, so the script powered
+# WLAN on immediately and killed the chip. Wait for the launcher's own
+# "Calibration end" instead.
 
 LOG=/tmp/recovery.log
 
@@ -27,12 +37,45 @@ wait_for() {
     [ -e "$1" ]
 }
 
+# wait_calibration <seconds>: the launcher prints "Calibration end" once the
+# ROM patch is downloaded and the chip is ready for WLAN.
+wait_calibration() {
+    local i=0
+    while [ "$i" -lt "$1" ]; do
+        dmesg | grep -q 'Calibration end' && return 0
+        sleep 1
+        i=$((i + 1))
+    done
+    return 1
+}
+
+# Power the connectivity SoC, start the launcher and wait for calibration.
+# bringup [seconds]: the boot pass allows 90 s, the on-demand path less.
+bringup() {
+    local wait_s="${1:-90}"
+    /vendor/bin/wmt_loader
+    log "wmt_loader rc=$?"
+    wait_for /dev/stpwmt 50 || log "no /dev/stpwmt after wmt_loader"
+
+    /vendor/bin/wmt_launcher -p /vendor/firmware/ -o 1 &
+    log "wmt_launcher started"
+
+    if wait_calibration "$wait_s"; then
+        log "calibration done"
+        sleep 2
+        return 0
+    fi
+    log "no calibration after $wait_s s"
+    return 1
+}
+
 # Writing 1 to /dev/wmtWifi asks the WLAN driver to power the WiFi function and
-# register wlan0. Until the launcher has finished its patch download this would
-# inject a WMT command into the STP stream the launcher is using, so wait for
-# the driver.ready property it sets at the end instead of guessing a sleep.
+# register wlan0. Do not write it again once wlan0 exists: a second power-on
+# request on an already-running function is rejected and logs
+# `WMT turn on WIFI fail!`, which reads like a failure in every later log.
 power_on_wifi() {
     local i=0
+    [ -e /sys/class/net/wlan0 ] && return 0
     while [ "$i" -lt "$1" ]; do
         if [ -e /dev/wmtWifi ]; then
             echo 1 > /dev/wmtWifi
@@ -45,36 +88,40 @@ power_on_wifi() {
 }
 
 if [ "$1" = "--boot" ]; then
-    /vendor/bin/wmt_loader
-    log "wmt_loader rc=$?"
-    wait_for /dev/stpwmt 50 || log "no /dev/stpwmt after wmt_loader"
-
-    /vendor/bin/wmt_launcher -p /vendor/firmware/ -o 1 &
-    log "wmt_launcher started"
-
-    # 30 s is generous: the patch download plus calibration took ~15 s on the
-    # first cold boot and less afterwards.
-    i=0
-    while [ "$i" -lt 300 ]; do
-        [ "$(getprop vendor.connsys.driver.ready)" = "yes" ] && break
-        sleep 0.1
-        i=$((i + 1))
-    done
-    log "launcher ready after $((i / 10)) s"
-
-    wait_for /dev/wmtWifi 50 || log "no /dev/wmtWifi after launcher"
-
-    if power_on_wifi 150; then
-        log "wlan0 registered"
+    # Let the kernel's connectivity driver finish probing. Running wmt_loader
+    # in the first second of boot fails the STP handshake.
+    sleep 10
+    if bringup; then
+        if power_on_wifi 150; then
+            log "wlan0 registered"
+        else
+            log "wlan0 did not appear at boot"
+        fi
     else
-        log "wlan0 did not appear at boot"
+        log "boot bring-up failed"
     fi
     exit 0
 fi
 
-# On demand. If the boot pass worked this returns almost immediately.
-wait_for /dev/wmtWifi 200 || log "on-demand: no /dev/wmtWifi"
-if ! power_on_wifi 150; then
+# On demand. wlan.cpp gives this 20 s (it waits for init.svc.wpa_supplicant to
+# reach "running"), so nothing here may block longer than that. When the boot
+# pass worked, wlan0 already exists and this is just ifconfig + the service
+# start. When it did not, ask the driver once more: the launcher may still be
+# alive and only the power-on request was lost.
+if [ ! -e /sys/class/net/wlan0 ]; then
+    log "on-demand: wlan0 missing, asking the driver again"
+    power_on_wifi 50
+fi
+
+if [ ! -e /sys/class/net/wlan0 ]; then
+    # Last resort: the boot pass never got the chip up. This takes ~15 s at
+    # best and will miss AERA's window, but a late supplicant is still better
+    # than none, and the next tap finds the interface already there.
+    log "on-demand: full bring-up"
+    bringup 20 && power_on_wifi 50
+fi
+
+if [ ! -e /sys/class/net/wlan0 ]; then
     log "on-demand: no wlan0"
     exit 1
 fi

@@ -25,8 +25,8 @@ on boot
     start aera-wlan-boot
 
 # One owner for the power sequence: aera-wlan-up.sh --boot runs wmt_loader,
-# starts wmt_launcher, waits for vendor.connsys.driver.ready, then powers the
-# WLAN function on. Do NOT also declare wmt_loader / wmt_launcher as separate
+# starts wmt_launcher, waits for its "Calibration end", then powers the WLAN
+# function on. Do NOT also declare wmt_loader / wmt_launcher as separate
 # services here: that ran the launcher twice, and two daemons fighting over
 # /dev/stpwmt corrupt the STP stream the patch download uses.
 
@@ -55,7 +55,12 @@ service aera-wlan-up /system/bin/sh /system/bin/aera-wlan-up.sh
     disabled
     seclabel u:r:recovery:s0
 
-service wpa_supplicant /vendor/bin/hw/wpa_supplicant -Dnl80211 -iwlan0 -dd -O/tmp/recovery/sockets -c/vendor/etc/wifi/wpa_supplicant.conf
+# AERA builds its own wpa_supplicant into /system/bin (the MTK vendor one at
+# /vendor/bin/hw does not exist in this ramdisk). wlan.cpp waits up to 60 s for
+# /tmp/recovery/sockets/wlan0 and a PING/PONG, which is exactly where
+# ctrl_interface=wlan0 in /vendor/etc/wifi/wpa_supplicant.conf puts the socket
+# once -O points at that directory.
+service wpa_supplicant /system/bin/wpa_supplicant -Dnl80211 -iwlan0 -dd -O/tmp/recovery/sockets -c/vendor/etc/wifi/wpa_supplicant.conf
     user root
     group root wifi inet net_admin
     disabled
