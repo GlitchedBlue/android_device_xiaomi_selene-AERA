@@ -289,9 +289,9 @@ using FreeFn = void (*)(void*);
 constexpr const char* kImplName =
     "android.hardware.graphics.allocator@4.0-impl-mediatek.so";
 constexpr const char* kImplDirs[] = {
-    "/gpu/stock-vendor/lib64/hw",
+    "/gpu-rescue/aera-gpu/vendor/lib64/hw",
     "/gpu/lib64/hw",
-    "/gpu/stock-vendor/lib64",
+    "/gpu-rescue/aera-gpu/vendor/lib64",
     "/gpu/lib64",
 };
 
