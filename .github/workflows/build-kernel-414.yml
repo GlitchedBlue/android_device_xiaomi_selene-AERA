@@ -103,12 +103,20 @@ jobs:
           export PATH="$RUNNER_TEMP/toolchain/bin:$PATH"
           export KBUILD_BUILD_HOST=github-actions
           export KBUILD_BUILD_USER=aera
+          # KCFLAGS is appended after KBUILD_CFLAGS (Makefile:1048), i.e. after
+          # the tree's own -Werror=strict-prototypes (Makefile:1020). clang 21
+          # reports the Mali r32p1 counter code's old-style declarations
+          # (mtk_mfg_counter.c:772 `int gator_gpu_pmu_init()`) through that
+          # -Werror, which stops the build. The declarations are vendor code we
+          # are not touching, so turn the diagnostic off instead of patching
+          # each one.
           FLAGS="ARCH=arm64 O=out CC=clang LLVM=1 LLVM_IAS=1 \
             LD=ld.lld AS=llvm-as AR=llvm-ar NM=llvm-nm \
             OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump READELF=llvm-readelf \
             STRIP=llvm-strip CROSS_COMPILE=aarch64-linux-gnu- \
             CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
-            CROSS_COMPILE_COMPAT=arm-linux-gnueabi-"
+            CROSS_COMPILE_COMPAT=arm-linux-gnueabi- \
+            KCFLAGS=-Wno-strict-prototypes"
           make -j"$(nproc)" $FLAGS selene_defconfig
           grep -E 'CONFIG_MTK_GPU_VERSION|CONFIG_MTK_GPU_SUPPORT|CONFIG_MTK_COMBO_WIFI' out/.config
           make -j"$(nproc)" $FLAGS Image.gz
