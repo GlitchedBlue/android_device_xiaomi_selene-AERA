@@ -66,8 +66,17 @@ PRODUCT_PACKAGES += libaera_boot_trim
 # ---------------------------------------------------------------------------
 # apkreader's mali-testing backend reads these properties at runtime and loads
 # the stock driver/HALs through a private linker namespace. The launch script
-# (recovery/root/system/bin/selene-gpu-launch.sh) stages the real system/vendor
-# libraries into /gpu/lib64; /system/bin/selene-gpu-test.sh is the manual probe.
+# (recovery/root/system/bin/selene-gpu-launch.sh) mounts the blob store on the
+# `rescue` partition and links the stock libraries into /gpu/lib64;
+# /system/bin/selene-gpu-test.sh is the manual probe.
+#
+# The properties name the blob store in place, with no bind mount. Two reasons:
+# bionic checks the *realpath* of every library against the namespace's
+# permitted paths (so a link that leaves them is refused even when the path it
+# was opened by is allowed), and a bind mount has to be visible in the mount
+# namespace of the process that loads the driver, which init's boot actions do
+# not guarantee for the recovery service. A real path on a real mount has
+# neither problem.
 #
 # Verified against the stock V14.0.7.0.TKUMIXM vendor dump (Android 13):
 #
@@ -93,11 +102,11 @@ PRODUCT_PACKAGES += libaera_boot_trim
 # two never drift.
 PRODUCT_PACKAGES += libaera_gralloc1
 PRODUCT_DEFAULT_PROPERTY_OVERRIDES += \
-    ro.aera.gpu.mali_driver=/gpu/stock-vendor/lib64/egl/libGLES_mali.so \
+    ro.aera.gpu.mali_driver=/gpu-rescue/aera-gpu/vendor/lib64/egl/libGLES_mali.so \
     ro.aera.gpu.mali_libraries=/gpu/lib64 \
-    ro.aera.gpu.gralloc=/gpu/stock-vendor/lib64/hw/gralloc.mt6768.so \
-    ro.aera.gpu.hwcomposer=/gpu/stock-vendor/lib64/hw/hwcomposer.mt6768.so \
-    ro.aera.gpu.mali_permitted_paths=/gpu:/vendor \
+    ro.aera.gpu.gralloc=/gpu-rescue/aera-gpu/vendor/lib64/hw/gralloc.mt6768.so \
+    ro.aera.gpu.hwcomposer=/gpu-rescue/aera-gpu/vendor/lib64/hw/hwcomposer.mt6768.so \
+    ro.aera.gpu.mali_permitted_paths=/gpu:/gpu-rescue:/vendor \
     ro.aera.gpu.hwc_acquire_fence_ownership=composer
 
 # MTK's composer keeps the acquire fence fd that setClientTarget() is given
