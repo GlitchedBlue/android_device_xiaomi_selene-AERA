@@ -1,74 +1,56 @@
 #!/system/bin/sh
 # SPDX-License-Identifier: Apache-2.0
 #
-# Stage selene's stock Mali graphics stack before AERA starts, when the stock
-# partitions happen to be reachable that early.
+# Stage selene's Mali graphics stack before AERA starts.
 #
-# selene ships an Android 13 MediaTek vendor image (mt6768, Mali-G52 MC2).
-# AERA 16 cannot link those prebuilts into its own process, so the Mali backend
-# (aeraui/core/mali_display.cpp) loads them through a private linker namespace.
-# The backend needs a gralloc1 module and an HWC2 module; if either is missing,
-# initialization fails and AERA keeps the software renderer.
+# The graphics blobs live in a blob store on the `rescue` partition
+# (/dev/block/by-name/rescue, mmcblk0p50): a plain ext4 volume with no
+# encryption and no device-mapper, so it is readable before anything maps
+# `super`.
 #
-# IMPORTANT: selene uses dynamic partitions. `vendor` lives inside `super`, so
-# there is no /dev/block/by-name/vendor until something maps the logical
-# partition, and AERA only does that in-process when it mounts a volume - well
-# after `on boot`. So on this device this hook normally finds nothing and exits
-# silently; the Mali backend then logs a driver-loading failure and falls back.
-# Use /system/bin/selene-gpu-test.sh (run manually after /vendor is mounted) for
-# the real diagnostic.
+# That matters because selene uses dynamic partitions: `vendor` lives inside
+# `super`, so there is no usable /vendor until AERA maps the logical partition
+# in-process - which happens a second *after* the recovery UI initialises the
+# GPU. Reading the blob store removes that ordering dependency entirely.
 #
-# The stock partitions are mounted read-only under /gpu. Nothing on the real
-# partitions is modified.
+# Blob store layout (written once with `adb push`):
 #
-# This script runs from `on boot` in init.recovery.mt6768.rc. It must NOT exec
-# /system/bin/recovery: init starts the recovery service itself after the boot
-# actions, so this script only stages files and exits.
+#   <rescue>/aera-gpu/vendor/lib64/{*.so, egl/*.so, hw/*.so}
+#   <rescue>/aera-gpu/system/lib64/*.so
+#
+# Nothing on the real system/vendor partitions is modified.
+#
+# The blob store is used in place: ro.aera.gpu.mali_driver and friends name
+# /gpu-rescue/... directly and /gpu/lib64 holds soname links into it. There is
+# deliberately no bind mount - see the comment above
+# PRODUCT_DEFAULT_PROPERTY_OVERRIDES in device.mk for why.
+#
+# This script runs from `on post-fs` in init.recovery.mt6768.rc, before init
+# starts any service class, and `exec` makes init wait for it. It must NOT exec
+# /system/bin/recovery: init starts the recovery service itself.
 
 export PATH=/system/bin:/sbin:/vendor/bin
 LOG=/tmp/aera-gpu-boot.log
 : > "$LOG"
 
-mkdir -p /gpu /gpu/stock-system /gpu/stock-vendor
-
 log() { echo "$*" >> "$LOG"; }
 
-mount_ro() {
-    target="$2"
-    if grep -qs " $target " /proc/mounts; then
-        log "already mounted: $target"
-        return 0
-    fi
-    for device in $1; do
-        [ -b "$device" ] || continue
-        if mount -o ro "$device" "$target" 2>/dev/null; then
-            log "mounted $device -> $target"
-            return 0
-        fi
-    done
-    log "could not mount $target"
-    return 1
-}
+BLOB=/gpu-rescue/aera-gpu
 
-# If recovery's own init already mounted the real volumes, reuse them.
-if [ -d /vendor/lib64 ]; then
-    mount --bind /vendor /gpu/stock-vendor 2>/dev/null &&
-        log "bound /vendor -> /gpu/stock-vendor"
-fi
-[ -d /gpu/stock-vendor/lib64 ] ||
-    mount_ro "/dev/block/mapper/vendor /dev/block/by-name/vendor" /gpu/stock-vendor
+mkdir -p /gpu /gpu-rescue
 
-if [ -d /system/lib64 ] && [ ! -d /gpu/stock-system/system/lib64 ]; then
-    mount --bind /system /gpu/stock-system 2>/dev/null &&
-        log "bound /system -> /gpu/stock-system"
+# Mount the blob store read-only. It is a plain block device, so this works
+# regardless of what init has or has not mounted yet.
+if ! grep -qs " /gpu-rescue " /proc/mounts; then
+    mount -o ro /dev/block/by-name/rescue /gpu-rescue 2>/dev/null &&
+        log "mounted rescue -> /gpu-rescue" ||
+        log "could not mount rescue"
 fi
-[ -d /gpu/stock-system/system/lib64 ] ||
-    mount_ro "/dev/block/mapper/system /dev/block/by-name/system" /gpu/stock-system
 
 for f in \
-    /gpu/stock-vendor/lib64/egl/libGLES_mali.so \
-    /gpu/stock-vendor/lib64/hw/hwcomposer.mt6768.so \
-    /gpu/stock-vendor/lib64/hw/gralloc.mt6768.so; do
+    "$BLOB/vendor/lib64/egl/libGLES_mali.so" \
+    "$BLOB/vendor/lib64/hw/hwcomposer.mt6768.so" \
+    "$BLOB/vendor/lib64/hw/gralloc.mt6768.so"; do
     if [ -f "$f" ]; then
         log "present: $f"
     else
@@ -76,10 +58,11 @@ for f in \
     fi
 done
 
-if [ -d /gpu/stock-vendor/lib64 ] && [ -d /gpu/stock-system/system/lib64 ]; then
+if [ -f "$BLOB/vendor/lib64/egl/libGLES_mali.so" ]; then
     sh /system/bin/selene-gpu-libraries.sh >> "$LOG" 2>&1 || log "library staging failed"
+    log "staged: $(ls /gpu/lib64 2>/dev/null | wc -l) libraries in /gpu/lib64"
 else
-    log "stock system/vendor not reachable at boot; GPU backend will fall back to software"
+    log "blob store empty at $BLOB; GPU backend will fall back to software"
 fi
 
 log "done"
