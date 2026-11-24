@@ -11,19 +11,21 @@ on init
     # mounts the system partition over the ramdisk's /system. See that .rc for
     # the ABI background and the /sbin placement.
 
-# Best-effort staging of the stock Android 13 Mali/HWC2 stack before init starts
-# the recovery service. This rc is imported before init.rc's own `on boot`, so
-# the boot actions run in parse order: this one first, then class_start default.
-# The script only mounts/stages; it must not exec recovery itself.
+# Staging of the stock MediaTek Mali/HWC2 stack from the blob store on the
+# `rescue` partition. This runs at `on post-fs`, which late-init triggers long
+# before `on boot`'s `class_start core`, and `exec` runs the program
+# synchronously, so the staging is always complete before init starts the
+# recovery service - the GPU is initialised by that service, not by this
+# script. The script only mounts and stages; it must not exec recovery itself.
 #
-# On selene this usually finds nothing: `vendor` is a logical partition inside
-# `super` and is not mapped this early, so the script logs and exits and AERA
-# keeps the software renderer. Run /system/bin/selene-gpu-test.sh by hand after
-# mounting /vendor for the real dependency probe.
-on boot
+# `vendor` is a logical partition inside `super` and is not mapped this early,
+# which is why the blobs come from `rescue` instead of /vendor. If the blob
+# store has not been populated yet, the script logs and exits and AERA keeps
+# the software renderer; /system/bin/selene-gpu-test.sh is the manual probe.
+on post-fs
+    wait /dev/block/by-name/rescue 2
     exec u:r:recovery:s0 root root -- /system/bin/sh /system/bin/selene-gpu-launch.sh
 
-on post-fs
     # Support A/B feature for EMMC and UFS boot region
     wait /dev/block/mmcblk0boot0 2
     symlink /dev/block/sda /dev/block/mmcblk0boot0
