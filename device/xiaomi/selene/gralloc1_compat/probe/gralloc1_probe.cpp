@@ -1313,7 +1313,7 @@ int main(int argc, char** argv) {
 #endif
 
   if (argc > 1 && strcmp(argv[1], "--hwc") == 0) {
-    const char* hwc_path = "/gpu/stock-vendor/lib64/hw/hwcomposer.mt6768.so";
+    const char* hwc_path = "/gpu-rescue/aera-gpu/vendor/lib64/hw/hwcomposer.mt6768.so";
     for (int i = 2; i < argc; ++i) {
       if (strncmp(argv[i], "--", 2) != 0) hwc_path = argv[i];
     }
@@ -1321,8 +1321,8 @@ int main(int argc, char** argv) {
   }
 
   if (argc > 1 && strcmp(argv[1], "--present") == 0) {
-    const char* hwc_path = "/gpu/stock-vendor/lib64/hw/hwcomposer.mt6768.so";
-    const char* shim_path = "/gpu/stock-vendor/lib64/hw/gralloc.mt6768.so";
+    const char* hwc_path = "/gpu-rescue/aera-gpu/vendor/lib64/hw/hwcomposer.mt6768.so";
+    const char* shim_path = "/gpu-rescue/aera-gpu/vendor/lib64/hw/gralloc.mt6768.so";
     uint32_t width = 1080;
     uint32_t height = 2400;
     int positional = 0;
@@ -1338,8 +1338,8 @@ int main(int argc, char** argv) {
   }
 
   if (argc > 1 && strcmp(argv[1], "--egl") == 0) {
-    const char* driver_path = "/gpu/stock-vendor/lib64/egl/libGLES_mali.so";
-    const char* shim_path = "/gpu/stock-vendor/lib64/hw/gralloc.mt6768.so";
+    const char* driver_path = "/gpu-rescue/aera-gpu/vendor/lib64/egl/libGLES_mali.so";
+    const char* shim_path = "/gpu-rescue/aera-gpu/vendor/lib64/hw/gralloc.mt6768.so";
     uint32_t width = 1080;
     uint32_t height = 2400;
     bool use_native = false;
@@ -1365,7 +1365,7 @@ int main(int argc, char** argv) {
   }
 
   if (argc > 1 && strcmp(argv[1], "--hotplug") == 0) {
-    const char* hwc_path = "/gpu/stock-vendor/lib64/hw/hwcomposer.mt6768.so";
+    const char* hwc_path = "/gpu-rescue/aera-gpu/vendor/lib64/hw/hwcomposer.mt6768.so";
     bool teardown = true;
     bool all_three = true;
     for (int i = 2; i < argc; ++i) {
@@ -1377,7 +1377,7 @@ int main(int argc, char** argv) {
   }
 
   if (argc > 1 && strcmp(argv[1], "--lifecycle") == 0) {
-    const char* hwc_path = "/gpu/stock-vendor/lib64/hw/hwcomposer.mt6768.so";
+    const char* hwc_path = "/gpu-rescue/aera-gpu/vendor/lib64/hw/hwcomposer.mt6768.so";
     bool teardown = true;
     for (int i = 2; i < argc; ++i) {
       if (strcmp(argv[i], "--no-teardown") == 0) teardown = false;
